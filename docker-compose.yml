@@ -1,0 +1,26 @@
+services:
+  exa:
+    build: .
+    container_name: exa
+    ports:
+      # Bind to loopback behind a TLS reverse proxy. Use "8080:8080" only for direct LAN or host exposure.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      # Allow unprivileged ICMP datagram sockets for ping monitors without CAP_NET_RAW.
+      net.ipv4.ping_group_range: "0 2147483647"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      TRUST_PROXY: "false"
+      # BASE_URL: https://status.example.com
+      # COOKIE_SECURE: "true" # Enabled automatically when BASE_URL starts with https://
+    restart: unless-stopped

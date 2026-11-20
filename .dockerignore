@@ -1,0 +1,7 @@
+.git
+data
+.verify-data
+exa.exe
+exa
+web/node_modules
+web/dist

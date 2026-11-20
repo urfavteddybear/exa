@@ -1,0 +1,9 @@
+/exa.exe
+/exa
+/data/
+/.verify-data/
+/web/node_modules/
+/web/dist/
+*.db
+*.db-wal
+*.db-shm
