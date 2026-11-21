@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -283,6 +284,7 @@ func (m *Manager) runWorker(ctx context.Context, mon model.Monitor, done chan st
 		}
 
 		if err := m.store.RecordHeartbeat(ctx, mon.ID, res, finalStatus, mon.IntervalSec); err != nil {
+			slog.Error("record heartbeat failed", "monitor_id", mon.ID, "monitor", mon.Name, "err", err)
 			return
 		}
 
@@ -399,6 +401,7 @@ func (m *Manager) checkPushWatchdog(ctx context.Context, now time.Time) {
 
 		prevStatus := mon.CurrentStatus
 		if err := m.store.RecordHeartbeat(ctx, mon.ID, res, finalStatus, mon.IntervalSec); err != nil {
+			slog.Error("record push watchdog heartbeat failed", "monitor_id", mon.ID, "monitor", mon.Name, "err", err)
 			continue
 		}
 		m.emitHeartbeatEvents(ctx, mon, res, prevStatus, finalStatus, inMaint && suppressAlerts)
@@ -449,7 +452,23 @@ func (m *Manager) emitHeartbeatEvents(
 		})
 	}
 
-	if !suppressNotify && m.notifier != nil {
+	if suppressNotify {
+		slog.Info("monitor state transition suppressed by maintenance",
+			"monitor_id", mon.ID,
+			"monitor", mon.Name,
+			"prev", prevStatus,
+			"next", finalStatus,
+		)
+		return
+	}
+
+	if m.notifier != nil {
+		slog.Info("monitor state transition dispatching notifications",
+			"monitor_id", mon.ID,
+			"monitor", mon.Name,
+			"prev", prevStatus,
+			"next", finalStatus,
+		)
 		m.notifier.NotifyMonitorStateChange(ctx, mon, prevStatus, finalStatus, res.Message)
 	}
 }

@@ -207,7 +207,15 @@ export function MonitorFormModal({
   useEffect(() => {
     if (!open) return;
     setError(null);
-    setForm(initial ? monitorToForm(initial) : emptyMonitorForm());
+    if (initial) {
+      setForm(monitorToForm(initial));
+      return;
+    }
+    const base = emptyMonitorForm();
+    base.notification_channel_ids = channels
+      .filter((ch) => ch.enabled && ch.is_default)
+      .map((ch) => ch.id);
+    setForm(base);
   }, [open, initial]);
 
   const handleSubmit = async (e: Event) => {
@@ -744,11 +752,15 @@ export function MonitorFormModal({
                     }}
                   />
                   <span>
-                    {ch.name} ({ch.type})
+                    {ch.name} ({ch.type}
+                    {ch.is_default ? ', Default' : ''})
                   </span>
                 </label>
               ))}
             </div>
+            <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--ops-text-secondary)' }}>
+              Default channels are pre-selected for new monitors. Leaving all unchecked uses all enabled Default channels automatically.
+            </p>
           </div>
         ) : null}
 

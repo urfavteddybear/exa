@@ -183,19 +183,19 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, cfg model.DiscordConfig, p
 		return errors.New("discord webhook_url is required")
 	}
 
-	username := strings.TrimSpace(cfg.Username)
+	username := truncateDiscordText(strings.TrimSpace(cfg.Username), 80)
 	if username == "" {
 		username = "Exa"
 	}
 
 	fields := []map[string]any{
-		{"name": "Event", "value": payload.Event, "inline": true},
-		{"name": "Severity", "value": payload.Severity, "inline": true},
+		{"name": "Event", "value": discordFieldValue(payload.Event), "inline": true},
+		{"name": "Severity", "value": discordFieldValue(payload.Severity), "inline": true},
 	}
 	if payload.Monitor != nil {
 		fields = append(fields,
-			map[string]any{"name": "Monitor", "value": payload.Monitor.Name, "inline": true},
-			map[string]any{"name": "Status", "value": string(payload.Monitor.CurrentStatus), "inline": true},
+			map[string]any{"name": "Monitor", "value": discordFieldValue(payload.Monitor.Name), "inline": true},
+			map[string]any{"name": "Status", "value": discordFieldValue(string(payload.Monitor.CurrentStatus)), "inline": true},
 		)
 	}
 
@@ -203,8 +203,8 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, cfg model.DiscordConfig, p
 		"username": username,
 		"embeds": []map[string]any{
 			{
-				"title":       payload.Title,
-				"description": payload.Message,
+				"title":       truncateDiscordText(payload.Title, 256),
+				"description": truncateDiscordText(payload.Message, 4000),
 				"color":       discordColor(payload.Severity),
 				"timestamp":   payload.Timestamp.UTC().Format(time.RFC3339),
 				"fields":      fields,
@@ -213,6 +213,28 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, cfg model.DiscordConfig, p
 	}
 
 	return d.postJSON(ctx, targetURL, bodyStruct, nil)
+}
+
+func discordFieldValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "-"
+	}
+	return truncateDiscordText(s, 1024)
+}
+
+func truncateDiscordText(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 func (d *Dispatcher) sendSlack(ctx context.Context, cfg model.SlackConfig, payload notificationPayload) error {
@@ -408,10 +430,15 @@ func doRequestWithClient(client *http.Client, req *http.Request) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		detail := strings.TrimSpace(string(errBody))
+		if detail != "" {
+			return fmt.Errorf("notification endpoint returned HTTP %d: %s", resp.StatusCode, detail)
+		}
 		return fmt.Errorf("notification endpoint returned HTTP %d", resp.StatusCode)
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
 	return nil
 }
 

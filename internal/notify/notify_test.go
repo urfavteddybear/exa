@@ -556,3 +556,82 @@ func TestSendSubscriberWebhook_SSRFAndRedirectsRejected(t *testing.T) {
 		t.Fatalf("expected 0 hits to redirected target, got %d", targetHits)
 	}
 }
+
+func TestSendDiscord_TruncatesOversizedFieldsAndIncludesErrorBody(t *testing.T) {
+	var captured struct {
+		Username string `json:"username"`
+		Embeds   []struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Fields      []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"fields"`
+		} `json:"embeds"`
+	}
+
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Errorf("decode discord payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer okSrv.Close()
+
+	d := NewDispatcher(nil)
+	err := d.sendDiscord(context.Background(), model.DiscordConfig{
+		WebhookURL: okSrv.URL,
+		Username:   strings.Repeat("x", 120),
+	}, notificationPayload{
+		Event:     "monitor_state_change",
+		Title:     strings.Repeat("T", 320),
+		Message:   strings.Repeat("M", 5000),
+		Severity:  "critical",
+		Timestamp: time.Now().UTC(),
+		Monitor: &monitorEventPayload{
+			Name:          strings.Repeat("N", 1200),
+			CurrentStatus: "",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected truncated discord payload to succeed, got: %v", err)
+	}
+	if len([]rune(captured.Username)) > 80 {
+		t.Errorf("expected username <= 80 runes, got %d", len([]rune(captured.Username)))
+	}
+	if len(captured.Embeds) != 1 {
+		t.Fatalf("expected 1 embed, got %d", len(captured.Embeds))
+	}
+	if len([]rune(captured.Embeds[0].Title)) > 256 {
+		t.Errorf("expected title <= 256 runes, got %d", len([]rune(captured.Embeds[0].Title)))
+	}
+	if len([]rune(captured.Embeds[0].Description)) > 4000 {
+		t.Errorf("expected description <= 4000 runes, got %d", len([]rune(captured.Embeds[0].Description)))
+	}
+	for _, f := range captured.Embeds[0].Fields {
+		if f.Value == "" {
+			t.Errorf("expected non-empty field value for %q", f.Name)
+		}
+		if len([]rune(f.Value)) > 1024 {
+			t.Errorf("expected field %q value <= 1024 runes, got %d", f.Name, len([]rune(f.Value)))
+		}
+	}
+
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"Invalid Form Body"}`))
+	}))
+	defer errSrv.Close()
+
+	err = d.sendDiscord(context.Background(), model.DiscordConfig{WebhookURL: errSrv.URL}, notificationPayload{
+		Event:     "test",
+		Title:     "Test",
+		Message:   "Test",
+		Severity:  "info",
+		Timestamp: time.Now().UTC(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "Invalid Form Body") {
+		t.Fatalf("expected HTTP 400 error body to surface, got: %v", err)
+	}
+}

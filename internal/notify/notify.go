@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -83,7 +84,12 @@ func (d *Dispatcher) NotifyMonitorStateChange(ctx context.Context, m model.Monit
 		return
 	}
 	channels, err := d.store.ListChannelsForMonitor(m.ID)
-	if err != nil || len(channels) == 0 {
+	if err != nil {
+		slog.Error("list notification channels failed", "monitor_id", m.ID, "monitor", m.Name, "err", err)
+		return
+	}
+	if len(channels) == 0 {
+		slog.Warn("no enabled notification channels for monitor transition", "monitor_id", m.ID, "monitor", m.Name, "prev", prev, "next", next)
 		return
 	}
 
@@ -114,7 +120,28 @@ func (d *Dispatcher) NotifyMonitorStateChange(ctx context.Context, m model.Monit
 		if !ch.Enabled {
 			continue
 		}
-		_ = d.sendChannel(ctx, ch, payload)
+		if err := d.sendChannel(ctx, ch, payload); err != nil {
+			slog.Error("monitor notification delivery failed",
+				"monitor_id", m.ID,
+				"monitor", m.Name,
+				"channel_id", ch.ID,
+				"channel", ch.Name,
+				"type", ch.Type,
+				"prev", prev,
+				"next", next,
+				"err", err,
+			)
+			continue
+		}
+		slog.Info("monitor notification delivered",
+			"monitor_id", m.ID,
+			"monitor", m.Name,
+			"channel_id", ch.ID,
+			"channel", ch.Name,
+			"type", ch.Type,
+			"prev", prev,
+			"next", next,
+		)
 	}
 }
 
@@ -209,24 +236,38 @@ func (d *Dispatcher) dispatchPageNotifications(ctx context.Context, pageID strin
 				}
 			}
 			if ch.IsDefault {
-				_ = d.sendChannel(ctx, ch, payload)
+				if err := d.sendChannel(ctx, ch, payload); err != nil {
+					slog.Error("page notification delivery failed",
+						"page_id", pageID,
+						"event", payload.Event,
+						"channel_id", ch.ID,
+						"channel", ch.Name,
+						"type", ch.Type,
+						"err", err,
+					)
+				}
 			}
 		}
 	}
 
 	subs, err := d.store.ListActiveSubscribers(pageID)
 	if err != nil {
+		slog.Error("list active subscribers failed", "page_id", pageID, "err", err)
 		return
 	}
 	for _, sub := range subs {
 		switch sub.Type {
 		case model.SubscriberTypeWebhook:
-			_ = d.sendSubscriberWebhook(ctx, sub.Endpoint, payload)
+			if err := d.sendSubscriberWebhook(ctx, sub.Endpoint, payload); err != nil {
+				slog.Warn("subscriber webhook delivery failed", "page_id", pageID, "subscriber_id", sub.ID, "err", err)
+			}
 		case model.SubscriberTypeEmail:
 			if emailCfg != nil {
 				subEmail := *emailCfg
 				subEmail.To = []string{sub.Endpoint}
-				_ = d.sendEmail(ctx, subEmail, payload)
+				if err := d.sendEmail(ctx, subEmail, payload); err != nil {
+					slog.Warn("subscriber email delivery failed", "page_id", pageID, "subscriber_id", sub.ID, "err", err)
+				}
 			}
 		}
 	}
