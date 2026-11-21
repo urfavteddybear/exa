@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"exa/internal/db"
@@ -78,50 +79,54 @@ type pageEventPayload struct {
 	Title string `json:"title"`
 }
 
-// NotifyMonitorStateChange notifies channels attached to m (or default channels).
+// NotifyMonitorStateChange notifies channels attached to m (or default channels) and public page subscribers.
 func (d *Dispatcher) NotifyMonitorStateChange(ctx context.Context, m model.Monitor, prev, next model.ComponentStatus, errMsg string) {
 	if d == nil || d.store == nil {
 		return
 	}
+
 	channels, err := d.store.ListChannelsForMonitor(m.ID)
 	if err != nil {
 		slog.Error("list notification channels failed", "monitor_id", m.ID, "monitor", m.Name, "err", err)
-		return
-	}
-	if len(channels) == 0 {
+	} else if len(channels) == 0 {
 		slog.Warn("no enabled notification channels for monitor transition", "monitor_id", m.ID, "monitor", m.Name, "prev", prev, "next", next)
-		return
-	}
-
-	msg := fmt.Sprintf("Monitor %s (%s) changed from %s to %s.", m.Name, m.Target, prev, next)
-	if errMsg != "" {
-		msg += " Details: " + errMsg
-	}
-
-	payload := notificationPayload{
-		Event:     "monitor_state_change",
-		Title:     fmt.Sprintf("[%s] %s is %s", statusTag(next), m.Name, next),
-		Message:   msg,
-		Severity:  severityForComponentStatus(next),
-		Timestamp: time.Now().UTC(),
-		Monitor: &monitorEventPayload{
-			ID:             m.ID,
-			Name:           m.Name,
-			Slug:           m.Slug,
-			Type:           m.Type,
-			Target:         m.Target,
-			PreviousStatus: prev,
-			CurrentStatus:  next,
-			Error:          errMsg,
-		},
-	}
-
-	for _, ch := range channels {
-		if !ch.Enabled {
-			continue
+	} else {
+		payload := notificationPayload{
+			Event:     "monitor_state_change",
+			Title:     adminMonitorTitle(m.Name, next),
+			Message:   adminMonitorMessage(m, prev, next, errMsg),
+			Severity:  severityForComponentStatus(next),
+			Timestamp: time.Now().UTC(),
+			Monitor: &monitorEventPayload{
+				ID:             m.ID,
+				Name:           m.Name,
+				Slug:           m.Slug,
+				Type:           m.Type,
+				Target:         m.Target,
+				PreviousStatus: prev,
+				CurrentStatus:  model.ComponentStatus(adminStatusLabel(next)),
+				Error:          errMsg,
+			},
 		}
-		if err := d.sendChannel(ctx, ch, payload); err != nil {
-			slog.Error("monitor notification delivery failed",
+
+		for _, ch := range channels {
+			if !ch.Enabled {
+				continue
+			}
+			if err := d.sendChannel(ctx, ch, payload); err != nil {
+				slog.Error("monitor notification delivery failed",
+					"monitor_id", m.ID,
+					"monitor", m.Name,
+					"channel_id", ch.ID,
+					"channel", ch.Name,
+					"type", ch.Type,
+					"prev", prev,
+					"next", next,
+					"err", err,
+				)
+				continue
+			}
+			slog.Info("monitor notification delivered",
 				"monitor_id", m.ID,
 				"monitor", m.Name,
 				"channel_id", ch.ID,
@@ -129,20 +134,11 @@ func (d *Dispatcher) NotifyMonitorStateChange(ctx context.Context, m model.Monit
 				"type", ch.Type,
 				"prev", prev,
 				"next", next,
-				"err", err,
 			)
-			continue
 		}
-		slog.Info("monitor notification delivered",
-			"monitor_id", m.ID,
-			"monitor", m.Name,
-			"channel_id", ch.ID,
-			"channel", ch.Name,
-			"type", ch.Type,
-			"prev", prev,
-			"next", next,
-		)
 	}
+
+	d.notifyPublicMonitorSubscribers(ctx, m, prev, next)
 }
 
 // NotifyIncidentUpdate notifies enabled default channels and active page subscribers.
@@ -225,36 +221,102 @@ func (d *Dispatcher) dispatchPageNotifications(ctx context.Context, pageID strin
 	channels, err := d.store.ListNotificationChannels()
 	var emailCfg *model.EmailConfig
 	if err == nil {
+		emailCfg = firstEnabledEmailConfig(channels)
 		for _, ch := range channels {
-			if !ch.Enabled {
+			if !ch.Enabled || !ch.IsDefault {
 				continue
 			}
-			if ch.Type == model.NotificationTypeEmail && emailCfg == nil {
-				var parsed model.EmailConfig
-				if jsonErr := json.Unmarshal(ch.Config, &parsed); jsonErr == nil && parsed.SMTPHost != "" {
-					emailCfg = &parsed
-				}
-			}
-			if ch.IsDefault {
-				if err := d.sendChannel(ctx, ch, payload); err != nil {
-					slog.Error("page notification delivery failed",
-						"page_id", pageID,
-						"event", payload.Event,
-						"channel_id", ch.ID,
-						"channel", ch.Name,
-						"type", ch.Type,
-						"err", err,
-					)
-				}
+			if err := d.sendChannel(ctx, ch, payload); err != nil {
+				slog.Error("page notification delivery failed",
+					"page_id", pageID,
+					"event", payload.Event,
+					"channel_id", ch.ID,
+					"channel", ch.Name,
+					"type", ch.Type,
+					"err", err,
+				)
 			}
 		}
 	}
 
+	d.deliverPageSubscribers(ctx, pageID, payload, emailCfg)
+}
+
+func (d *Dispatcher) notifyPublicMonitorSubscribers(ctx context.Context, m model.Monitor, prev, next model.ComponentStatus) {
+	allowSubs, err := d.store.GetSetting("allow_subscriptions")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(allowSubs), "true") {
+		return
+	}
+
+	isRecovery := next == model.ComponentStatusOperational &&
+		(prev == model.ComponentStatusDegraded || prev == model.ComponentStatusMajorOutage)
+	if next != model.ComponentStatusDegraded && next != model.ComponentStatusMajorOutage && !isRecovery {
+		return
+	}
+
+	bindings, err := d.store.ListPublicPagesForMonitor(m.ID)
+	if err != nil || len(bindings) == 0 {
+		return
+	}
+
+	var emailCfg *model.EmailConfig
+	emailLoaded := false
+
+	for _, binding := range bindings {
+		page := binding.Page
+		subs, err := d.store.ListActiveSubscribers(page.ID)
+		if err != nil {
+			slog.Error("list active subscribers failed", "page_id", page.ID, "err", err)
+			continue
+		}
+		if len(subs) == 0 {
+			continue
+		}
+
+		if !emailLoaded {
+			for _, sub := range subs {
+				if sub.Type == model.SubscriberTypeEmail {
+					if channels, chErr := d.store.ListNotificationChannels(); chErr == nil {
+						emailCfg = firstEnabledEmailConfig(channels)
+					}
+					emailLoaded = true
+					break
+				}
+			}
+		}
+
+		compName := strings.TrimSpace(binding.DisplayName)
+		if compName == "" {
+			compName = m.Name
+		}
+
+		payload := notificationPayload{
+			Event:     "component_status_change",
+			Title:     fmt.Sprintf("[%s] %s: %s", statusTag(next), page.Title, compName),
+			Message:   fmt.Sprintf("Component %s status changed from %s to %s.", compName, prev, next),
+			Severity:  severityForComponentStatus(next),
+			Timestamp: time.Now().UTC(),
+			StatusPage: &pageEventPayload{
+				ID:    page.ID,
+				Slug:  page.Slug,
+				Title: page.Title,
+			},
+		}
+
+		d.deliverSubscribersList(ctx, page.ID, subs, payload, emailCfg)
+	}
+}
+
+func (d *Dispatcher) deliverPageSubscribers(ctx context.Context, pageID string, payload notificationPayload, emailCfg *model.EmailConfig) {
 	subs, err := d.store.ListActiveSubscribers(pageID)
 	if err != nil {
 		slog.Error("list active subscribers failed", "page_id", pageID, "err", err)
 		return
 	}
+	d.deliverSubscribersList(ctx, pageID, subs, payload, emailCfg)
+}
+
+func (d *Dispatcher) deliverSubscribersList(ctx context.Context, pageID string, subs []model.Subscriber, payload notificationPayload, emailCfg *model.EmailConfig) {
 	for _, sub := range subs {
 		switch sub.Type {
 		case model.SubscriberTypeWebhook:
@@ -271,6 +333,19 @@ func (d *Dispatcher) dispatchPageNotifications(ctx context.Context, pageID strin
 			}
 		}
 	}
+}
+
+func firstEnabledEmailConfig(channels []model.NotificationChannel) *model.EmailConfig {
+	for _, ch := range channels {
+		if !ch.Enabled || ch.Type != model.NotificationTypeEmail {
+			continue
+		}
+		var parsed model.EmailConfig
+		if err := json.Unmarshal(ch.Config, &parsed); err == nil && strings.TrimSpace(parsed.SMTPHost) != "" {
+			return &parsed
+		}
+	}
+	return nil
 }
 
 func (d *Dispatcher) sendChannel(ctx context.Context, ch model.NotificationChannel, payload notificationPayload) error {
@@ -322,10 +397,56 @@ func (d *Dispatcher) sendChannel(ctx context.Context, ch model.NotificationChann
 	}
 }
 
+func adminMonitorTitle(name string, next model.ComponentStatus) string {
+	switch next {
+	case model.ComponentStatusMajorOutage:
+		return fmt.Sprintf("[DOWN] %s is DOWN", name)
+	case model.ComponentStatusDegraded:
+		return fmt.Sprintf("[DEGRADED] %s is DEGRADED", name)
+	case model.ComponentStatusOperational:
+		return fmt.Sprintf("[UP] %s is back UP", name)
+	default:
+		return fmt.Sprintf("[%s] %s is %s", statusTag(next), name, adminStatusLabel(next))
+	}
+}
+
+func adminMonitorMessage(m model.Monitor, prev, next model.ComponentStatus, errMsg string) string {
+	var msg string
+	switch next {
+	case model.ComponentStatusMajorOutage:
+		msg = fmt.Sprintf("Monitor %s (%s) is DOWN (previous: %s).", m.Name, m.Target, prev)
+	case model.ComponentStatusDegraded:
+		msg = fmt.Sprintf("Monitor %s (%s) is DEGRADED (previous: %s).", m.Name, m.Target, prev)
+	case model.ComponentStatusOperational:
+		msg = fmt.Sprintf("Monitor %s (%s) is back UP (previous: %s).", m.Name, m.Target, prev)
+	default:
+		msg = fmt.Sprintf("Monitor %s (%s) changed from %s to %s.", m.Name, m.Target, prev, next)
+	}
+	if errMsg != "" {
+		msg += " Details: " + errMsg
+	}
+	return msg
+}
+
+func adminStatusLabel(st model.ComponentStatus) string {
+	switch st {
+	case model.ComponentStatusMajorOutage:
+		return "down"
+	case model.ComponentStatusDegraded:
+		return "degraded"
+	case model.ComponentStatusOperational:
+		return "up"
+	case model.ComponentStatusMaintenance:
+		return "maintenance"
+	default:
+		return string(st)
+	}
+}
+
 func statusTag(st model.ComponentStatus) string {
 	switch st {
 	case model.ComponentStatusOperational:
-		return "OK"
+		return "UP"
 	case model.ComponentStatusDegraded:
 		return "DEGRADED"
 	case model.ComponentStatusMajorOutage:

@@ -688,12 +688,27 @@ type UserCreateRequest struct {
 	Role     UserRole `json:"role"`
 }
 
+type BackupDailyRollup struct {
+	MonitorID      string `json:"monitor_id"`
+	Day            string `json:"day"`
+	TotalChecks    int    `json:"total_checks"`
+	UpChecks       int    `json:"up_checks"`
+	DegradedChecks int    `json:"degraded_checks"`
+	DownChecks     int    `json:"down_checks"`
+	SumLatencyMs   int64  `json:"sum_latency_ms"`
+	MinLatencyMs   int    `json:"min_latency_ms"`
+	MaxLatencyMs   int    `json:"max_latency_ms"`
+	DowntimeSec    int    `json:"downtime_sec"`
+}
+
 type BackupData struct {
 	Version              int                   `json:"version"`
 	ExportedAt           time.Time             `json:"exported_at"`
 	Settings             map[string]string     `json:"settings"`
 	ComponentGroups      []ComponentGroup      `json:"component_groups"`
 	Monitors             []Monitor             `json:"monitors"`
+	Heartbeats           []Heartbeat           `json:"heartbeats,omitempty"`
+	DailyRollups         []BackupDailyRollup   `json:"daily_rollups,omitempty"`
 	StatusPages          []StatusPage          `json:"status_pages"`
 	StatusPageMonitors   []StatusPageMonitor   `json:"status_page_monitors"`
 	NotificationChannels []NotificationChannel `json:"notification_channels"`
@@ -701,4 +716,25 @@ type BackupData struct {
 	Incidents            []Incident            `json:"incidents"`
 	Maintenances         []Maintenance         `json:"maintenances"`
 	Subscribers          []Subscriber          `json:"subscribers"`
+}
+
+type PublicMonitorPageBinding struct {
+	Page        StatusPage
+	DisplayName string
+}
+
+type S3BackupObject struct {
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified"`
+}
+
+type S3BackupResult struct {
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	UploadedAt   time.Time `json:"uploaded_at"`
+	Pruned       int       `json:"pruned"`
+	Monitors     int       `json:"monitors"`
+	Heartbeats   int       `json:"heartbeats"`
+	DailyRollups int       `json:"daily_rollups"`
 }

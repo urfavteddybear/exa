@@ -319,16 +319,68 @@ func TestIncidentsMaintenancesChannelsAndBackup(t *testing.T) {
 		t.Fatalf("DeactivateSubscriberByToken: %v", err)
 	}
 
+	ctx := context.Background()
+	if err := s.RecordHeartbeat(ctx, mon.ID, model.ProbeResult{
+		Status:     model.HeartbeatStatusUp,
+		LatencyMs:  10,
+		StatusCode: 200,
+		Message:    "ok",
+		CheckedAt:  now.Add(-2 * time.Minute),
+	}, model.ComponentStatusOperational, 60); err != nil {
+		t.Fatalf("RecordHeartbeat 1: %v", err)
+	}
+	if err := s.RecordHeartbeat(ctx, mon.ID, model.ProbeResult{
+		Status:     model.HeartbeatStatusDegraded,
+		LatencyMs:  25,
+		StatusCode: 200,
+		Message:    "slow",
+		CheckedAt:  now.Add(-1 * time.Minute),
+	}, model.ComponentStatusDegraded, 60); err != nil {
+		t.Fatalf("RecordHeartbeat 2: %v", err)
+	}
+
 	backup, err := s.ExportBackup()
 	if err != nil {
 		t.Fatalf("ExportBackup: %v", err)
 	}
+	if backup.Version != 2 {
+		t.Fatalf("expected backup version 2, got %d", backup.Version)
+	}
+	if len(backup.Heartbeats) != 2 {
+		t.Fatalf("expected 2 heartbeats in backup, got %d", len(backup.Heartbeats))
+	}
+	if len(backup.DailyRollups) != 1 || backup.DailyRollups[0].SumLatencyMs != 35 {
+		t.Fatalf("expected 1 daily rollup with SumLatencyMs=35, got %+v", backup.DailyRollups)
+	}
+
+	// Wipe heartbeats before restore to prove ImportBackup restores monitoring history intact while preserving users.
+	if _, err := s.db.Exec(`DELETE FROM heartbeats`); err != nil {
+		t.Fatalf("clear heartbeats: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM daily_rollups`); err != nil {
+		t.Fatalf("clear daily_rollups: %v", err)
+	}
+
 	if err := s.ImportBackup(*backup); err != nil {
 		t.Fatalf("ImportBackup: %v", err)
 	}
 	monitorsAfter, err := s.ListMonitors()
 	if err != nil || len(monitorsAfter) != 1 {
 		t.Fatalf("expected 1 monitor after import, got %d err=%v", len(monitorsAfter), err)
+	}
+	hbsAfter, err := s.ListHeartbeats(mon.ID, 10)
+	if err != nil || len(hbsAfter) != 2 {
+		t.Fatalf("expected 2 restored heartbeats, got %d err=%v", len(hbsAfter), err)
+	}
+	fromDay := now.UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	toDay := now.UTC().AddDate(0, 0, 1).Format("2006-01-02")
+	rollupsAfter, err := s.GetDailyRollups(mon.ID, fromDay, toDay)
+	if err != nil || len(rollupsAfter) != 1 || rollupsAfter[0].AvgLatencyMs != 17.5 {
+		t.Fatalf("expected restored rollup avg latency 17.5, got %+v err=%v", rollupsAfter, err)
+	}
+	usersAfter, err := s.ListUsers()
+	if err != nil || len(usersAfter) != 1 || usersAfter[0].Username != "admin" {
+		t.Fatalf("expected existing admin account preserved across backup import, got %+v err=%v", usersAfter, err)
 	}
 
 	// Verify allow_subscriptions defaults to false.

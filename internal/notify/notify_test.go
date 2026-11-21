@@ -557,6 +557,160 @@ func TestSendSubscriberWebhook_SSRFAndRedirectsRejected(t *testing.T) {
 	}
 }
 
+func TestDispatcher_AdminVsPublicSubscriberMonitorAlerts(t *testing.T) {
+	store, err := db.OpenPath(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	var mu sync.Mutex
+	var adminEvents []notificationPayload
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p notificationPayload
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		mu.Lock()
+		adminEvents = append(adminEvents, p)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer adminSrv.Close()
+
+	var subEvents []notificationPayload
+	subSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p notificationPayload
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		mu.Lock()
+		subEvents = append(subEvents, p)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer subSrv.Close()
+
+	if _, err := store.CreateNotificationChannel(model.NotificationChannel{
+		Name:      "admin-hook",
+		Type:      model.NotificationTypeWebhook,
+		Config:    mustJSON(t, model.WebhookConfig{URL: adminSrv.URL}),
+		IsDefault: true,
+		Enabled:   true,
+	}); err != nil {
+		t.Fatalf("create admin channel: %v", err)
+	}
+
+	page, err := store.CreateStatusPage(model.StatusPage{
+		Slug:     "public",
+		Title:    "Public Status",
+		IsPublic: true,
+	})
+	if err != nil {
+		t.Fatalf("create status page: %v", err)
+	}
+
+	mon, err := store.CreateMonitor(model.Monitor{
+		Name:   "Internal Billing",
+		Type:   model.MonitorTypeHTTP,
+		Target: "http://10.99.0.5:9000/internal-health",
+		Active: true,
+	})
+	if err != nil {
+		t.Fatalf("create monitor: %v", err)
+	}
+
+	if err := store.SetStatusPageMonitors(page.ID, []model.StatusPageMonitor{
+		{
+			StatusPageID: page.ID,
+			MonitorID:    mon.ID,
+			DisplayName:  "Billing API",
+		},
+	}); err != nil {
+		t.Fatalf("attach monitor to page: %v", err)
+	}
+
+	if _, err := store.CreateSubscriber(model.Subscriber{
+		StatusPageID: page.ID,
+		Type:         model.SubscriberTypeWebhook,
+		Endpoint:     "https://example.com/sub-hook",
+		Verified:     true,
+		Active:       true,
+	}); err != nil {
+		t.Fatalf("create subscriber: %v", err)
+	}
+
+	d := NewDispatcher(store)
+	tr := subSrv.Client().Transport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, subSrv.Listener.Addr().String())
+	}
+	d.subscriberClient.Transport = tr
+
+	ctx := context.Background()
+	secretErr := "dial tcp 10.99.0.5:9000: internal connection refused"
+
+	// With allow_subscriptions unset/false, only admin receives the DOWN alert.
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusOperational, model.ComponentStatusMajorOutage, secretErr)
+
+	mu.Lock()
+	if len(adminEvents) != 1 || len(subEvents) != 0 {
+		mu.Unlock()
+		t.Fatalf("expected 1 admin and 0 sub events when allow_subscriptions off, got admin=%d sub=%d", len(adminEvents), len(subEvents))
+	}
+	if adminEvents[0].Title != "[DOWN] Internal Billing is DOWN" {
+		mu.Unlock()
+		t.Fatalf("unexpected admin DOWN title: %q", adminEvents[0].Title)
+	}
+	if adminEvents[0].Monitor == nil || adminEvents[0].Monitor.CurrentStatus != "down" {
+		mu.Unlock()
+		t.Fatalf("expected admin monitor current_status 'down', got %+v", adminEvents[0].Monitor)
+	}
+	if !strings.Contains(adminEvents[0].Message, mon.Target) || !strings.Contains(adminEvents[0].Message, secretErr) {
+		mu.Unlock()
+		t.Fatalf("expected admin message to include target and error details, got %q", adminEvents[0].Message)
+	}
+	mu.Unlock()
+
+	// Enable public subscriptions and trigger DEGRADED, DOWN, recovery UP, and non-public-triggering transitions.
+	if err := store.SetSetting("allow_subscriptions", "true"); err != nil {
+		t.Fatalf("enable allow_subscriptions: %v", err)
+	}
+
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusOperational, model.ComponentStatusDegraded, "slow internal query")
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusDegraded, model.ComponentStatusMajorOutage, secretErr)
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusMajorOutage, model.ComponentStatusOperational, "")
+	// Maintenance and unknown -> operational must NOT notify public subscribers.
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusOperational, model.ComponentStatusMaintenance, "")
+	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusUnknown, model.ComponentStatusOperational, "")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(adminEvents) != 6 {
+		t.Fatalf("expected 6 admin events total, got %d", len(adminEvents))
+	}
+	if adminEvents[1].Title != "[DEGRADED] Internal Billing is DEGRADED" {
+		t.Fatalf("unexpected admin DEGRADED title: %q", adminEvents[1].Title)
+	}
+	if adminEvents[3].Title != "[UP] Internal Billing is back UP" {
+		t.Fatalf("unexpected admin UP title: %q", adminEvents[3].Title)
+	}
+
+	if len(subEvents) != 3 {
+		t.Fatalf("expected 3 public subscriber events (degraded, down, recovery up), got %d", len(subEvents))
+	}
+	for i, ev := range subEvents {
+		if ev.Event != "component_status_change" {
+			t.Errorf("sub[%d] expected event component_status_change, got %q", i, ev.Event)
+		}
+		if ev.Monitor != nil {
+			t.Errorf("sub[%d] expected Monitor to be nil, got %+v", i, ev.Monitor)
+		}
+		if !strings.Contains(ev.Title, "Billing API") || !strings.Contains(ev.Message, "Billing API") {
+			t.Errorf("sub[%d] expected public display name Billing API, got title=%q msg=%q", i, ev.Title, ev.Message)
+		}
+		if strings.Contains(ev.Message, "10.99.0.5") || strings.Contains(ev.Message, "internal") {
+			t.Errorf("sub[%d] leaked internal target/error in message: %q", i, ev.Message)
+		}
+	}
+}
+
 func TestSendDiscord_TruncatesOversizedFieldsAndIncludesErrorBody(t *testing.T) {
 	var captured struct {
 		Username string `json:"username"`

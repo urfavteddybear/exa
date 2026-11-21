@@ -374,3 +374,37 @@ export interface PaginatedIncidentsResponse {
   page: number;
   limit: number;
 }
+
+export interface S3BackupObject {
+  key: string;
+  size: number;
+  last_modified: string;
+}
+
+export interface S3BackupResult {
+  key: string;
+  size: number;
+  uploaded_at: string;
+  pruned: number;
+  monitors: number;
+  heartbeats: number;
+  daily_rollups: number;
+}
+
+export interface BackupImportResponse {
+  ok: boolean;
+  message?: string;
+  monitors?: number;
+  heartbeats?: number;
+  daily_rollups?: number;
+}
+
+export interface S3TestPayload {
+  s3_endpoint?: string;
+  s3_region?: string;
+  s3_bucket?: string;
+  s3_prefix?: string;
+  s3_access_key_id?: string;
+  s3_secret_access_key?: string;
+  s3_force_path_style?: string;
+}

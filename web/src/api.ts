@@ -2,6 +2,7 @@ import type {
   AdminOverviewResponse,
   APIKey,
   APIKeyCreateResponse,
+  BackupImportResponse,
   ComponentGroup,
   Incident,
   IncidentImpact,
@@ -16,6 +17,9 @@ import type {
   PaginatedIncidentsResponse,
   ProbeResult,
   PublicStatusResponse,
+  S3BackupObject,
+  S3BackupResult,
+  S3TestPayload,
   StatusPage,
   StatusPageMonitor,
   Subscriber,
@@ -342,10 +346,75 @@ export const api = {
       body: JSON.stringify(body),
     }),
   exportBackup: () => request<unknown>('/api/v1/backup/export'),
+  exportBackupBlob: async (gzip: boolean): Promise<Blob> => {
+    const url = gzip ? '/api/v1/backup/export?format=gzip' : '/api/v1/backup/export';
+    const res = await fetch(url, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let msg = `Export failed with status ${res.status}`;
+      try {
+        const data = (await res.json()) as { error?: string };
+        if (data?.error) msg = data.error;
+      } catch {
+        // Ignore JSON parse errors on error body.
+      }
+      throw new ApiError(res.status, msg);
+    }
+    return res.blob();
+  },
   importBackup: (payload: unknown) =>
-    request<{ ok?: boolean; message?: string }>('/api/v1/backup/import', {
+    request<BackupImportResponse>('/api/v1/backup/import', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+  importBackupFile: async (file: File): Promise<BackupImportResponse> => {
+    const isGzip =
+      file.name.toLowerCase().endsWith('.gz') ||
+      file.type === 'application/gzip' ||
+      file.type === 'application/x-gzip';
+    const res = await fetch('/api/v1/backup/import', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': isGzip ? 'application/gzip' : 'application/json',
+      },
+      body: file,
+    });
+    const text = await res.text();
+    let data: unknown = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+    }
+    if (!res.ok) {
+      const msg =
+        data && typeof data === 'object' && 'error' in data && typeof (data as { error: unknown }).error === 'string'
+          ? (data as { error: string }).error
+          : `Import failed with status ${res.status}`;
+      throw new ApiError(res.status, msg);
+    }
+    return data as BackupImportResponse;
+  },
+  testS3Backup: (payload?: S3TestPayload) =>
+    request<{ ok: boolean }>('/api/v1/backup/s3/test', {
+      method: 'POST',
+      body: payload ? JSON.stringify(payload) : undefined,
+    }),
+  runS3Backup: () =>
+    request<S3BackupResult>('/api/v1/backup/s3/run', {
+      method: 'POST',
+    }),
+  listS3Backups: () => request<S3BackupObject[]>('/api/v1/backup/s3/list'),
+  restoreS3Backup: (key: string) =>
+    request<BackupImportResponse>('/api/v1/backup/s3/restore', {
+      method: 'POST',
+      body: JSON.stringify({ key }),
+    }),
+  deleteS3Backup: (key: string) =>
+    request<{ ok: boolean }>(`/api/v1/backup/s3/object?key=${encodeURIComponent(key)}`, {
+      method: 'DELETE',
     }),
 };
 

@@ -7,11 +7,11 @@ This document covers self-hosted deployment (Docker and native binary), configur
 Exa is compiled into a single Go binary containing an embedded Preact SPA (`web/dist`) and an embedded pure-Go SQLite engine (`modernc.org/sqlite`) running in WAL mode.
 
 Core runtime components:
-- **Probe scheduler**: executes periodic checks (`http`, `tcp`, `ping`, `dns`) with configurable intervals, timeouts, retries, and degraded latency thresholds.
+- **Probe scheduler**: executes periodic checks (`http`, `tcp`, `ping`, `dns`) with configurable intervals, timeouts, fast in-cycle retries (`5s` cadence), and degraded latency thresholds.
 - **Push receiver**: accepts inbound heartbeats from cron jobs and workers via token URLs (`push` monitors) and marks monitors down when the configured grace window expires.
 - **Status & incident engine**: computes 90-day daily uptime rollups, overall status banners, incident timelines, and scheduled maintenance windows.
 - **Notification dispatcher**: sends state change, incident, and maintenance alerts across `webhook` (HMAC-SHA256), `discord`, `slack`, `telegram`, `email` (SMTP), and `ntfy`, plus optional public email/HTTPS webhook subscribers.
-- **Real-time & integration outputs**: Server-Sent Events (`/api/v1/stream`), Prometheus `/metrics`, SVG badges, RSS 2.0 / Atom 1.0 feeds, and JSON backup export/import.
+- **Real-time & integration outputs**: Server-Sent Events (`/api/v1/stream`), Prometheus `/metrics`, SVG badges, RSS 2.0 / Atom 1.0 feeds, full-history `.json.gz`/`.json` backups, and S3-compatible remote backups (`AWS4-HMAC-SHA256`).
 
 ---
 
@@ -39,6 +39,19 @@ Managed via the Admin Settings UI or `GET/PUT /api/v1/settings`:
 | `metrics_token` | empty | Bearer token required by `/metrics`; `/metrics` returns `401` when empty |
 | `base_url` | empty | Persisted public base URL override |
 | `allow_subscriptions` | `"false"` | Enables public status page subscriptions when `"true"` |
+| `s3_enabled` | `"false"` | Enables scheduled remote backups to S3-compatible storage when `"true"` |
+| `s3_endpoint` | empty | S3 HTTP or HTTPS endpoint URL (e.g. `https://s3.amazonaws.com`, `http://127.0.0.1:9000`) |
+| `s3_region` | `"us-east-1"` | S3 signing region for `AWS4-HMAC-SHA256` requests |
+| `s3_bucket` | empty | Target S3 bucket name |
+| `s3_prefix` | `"exa-backups/"` | Object key prefix for remote backup files |
+| `s3_access_key_id` | empty | S3 access key ID |
+| `s3_secret_access_key` | empty | S3 secret access key (masked as `"********"` in `GET`/`PUT /api/v1/settings`; sending `""` or `"********"` preserves the saved secret) |
+| `s3_force_path_style` | `"true"` | Uses path-style URLs (`endpoint/bucket/key`) when `"true"`, or virtual-hosted URLs when `"false"` |
+| `s3_schedule` | `"off"` | Scheduled remote backup frequency: `off`, `hourly`, `daily`, or `weekly` |
+| `s3_retention_count` | `"14"` | Maximum remote backup objects to retain (`0` keeps all objects; oldest beyond limit are pruned) |
+| `s3_last_backup_at` | empty | Read-only UTC RFC3339 timestamp of the last successful S3 backup (server-managed) |
+| `s3_last_backup_key` | empty | Read-only object key of the last successful S3 backup (server-managed) |
+| `s3_last_error` | empty | Read-only error message from the last failed S3 backup attempt (server-managed) |
 | `setup_completed` | `"false"` | Read-only system flag set during `/api/v1/setup` (ignored by `PUT /api/v1/settings`) |
 
 ---
@@ -214,7 +227,11 @@ server {
   - `GET /api/v1/stream`: capped at 500 concurrent SSE connections globally and 10 per IP
 - **Subscriber Webhook SSRF Guard**: when `allow_subscriptions=true`, public webhook subscribers require `https://`, non-private routable IP addresses at subscribe and delivery time, and reject HTTP `3xx` redirects.
 - **Response Security Headers**: Exa attaches `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, and a self-contained `Content-Security-Policy` (`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`).
-- **Backups**: exported backup JSON (`GET /api/v1/backup/export`) contains monitor configs (including `push_token`), notification channel secrets, and subscriber records. Store exports securely. Backup imports (`POST /api/v1/backup/import`) accept payloads up to `10 MiB`.
+- **Alerting & Fast Retry Semantics**:
+  - **Fast in-cycle retries**: active monitors (`http`, `tcp`, `ping`, `dns`) re-check failed probes on a fast `5s` cadence (`min(5s, interval_sec)`) while `1 <= consecutiveDown <= retries`. With `retries=0`, the first failure transitions and alerts immediately; with `retries=2`, an outage confirms and alerts within ~10s instead of waiting multiple full check intervals.
+  - **Admin channel alerts**: sent on monitor transitions (unless suppressed by active maintenance with `auto_suppress_alerts`) to linked or default channels (`webhook`, `discord`, `slack`, `telegram`, `email`, `ntfy`) using `[DOWN] <name> is DOWN`, `[DEGRADED] <name> is DEGRADED`, and `[UP] <name> is back UP` with monitor target, previous status, and probe error details.
+  - **Public status page subscriber alerts**: when `allow_subscriptions=true`, verified email and HTTPS webhook subscribers on a public status page receive `component_status_change` notifications only for monitors attached to that page when status changes to `degraded`, `major_outage`, or recovers to `operational`. Payloads use the status page component `display_name` (or monitor name) and omit internal monitor targets and raw probe errors.
+- **Backups & S3 Remote Backups**: full-history Backup v2 (`version: 2`, `.json.gz` or plain `.json`) exports `settings`, `component_groups`, `monitors`, `heartbeats`, `daily_rollups`, `status_pages`, `status_page_monitors`, `notification_channels`, `monitor_notifications`, `incidents`, `maintenances`, and `subscribers`, while excluding `users`, `sessions`, and `api_keys` (existing user accounts and active sessions remain intact on restore). Store exports securely because they contain `push_token` values, notification channel secrets, and `s3_secret_access_key`. Backup imports accept up to `256 MiB` raw upload and `512 MiB` decoded JSON. Scheduled S3 backups (`s3_enabled=true`, `s3_schedule`: `hourly|daily|weekly`) upload gzipped backups via `AWS4-HMAC-SHA256`, enforce a 10-minute attempt cooldown, and prune oldest objects beyond `s3_retention_count`.
 
 ---
 
@@ -347,10 +364,15 @@ Notification `config` schemas by `type`:
 | `GET` | `/api/v1/users` | Admin | Lists users |
 | `POST` | `/api/v1/users` | Admin | Body: `{"username","email","password","role":"admin|viewer"}` (`password` >= 10 chars) |
 | `DELETE` | `/api/v1/users/{id}` | Admin | Deletes user (cannot delete self) |
-| `GET` | `/api/v1/settings` | Admin | Returns key-value settings map |
-| `PUT` | `/api/v1/settings` | Admin | Body: `{"key":"value",...}` (ignores `setup_completed`) |
-| `GET` | `/api/v1/backup/export` | Admin | Downloads `exa-backup.json` (`BackupData` JSON) |
-| `POST` | `/api/v1/backup/import` | Admin | Restores `BackupData` JSON (max `10 MiB`) and reloads active monitors |
+| `GET` | `/api/v1/settings` | Admin | Returns key-value settings map (`s3_secret_access_key` masked as `"********"`) |
+| `PUT` | `/api/v1/settings` | Admin | Body: `{"key":"value",...}` (ignores `setup_completed` and server-managed `s3_last_*` keys; sending `""` or `"********"` for `s3_secret_access_key` preserves existing secret; validates `s3_schedule` and `s3_retention_count`) |
+| `GET` | `/api/v1/backup/export` | Admin | Downloads full-history Backup v2 as `exa-backup.json` (plain JSON) or `exa-backup-YYYYMMDD-HHMMSSZ.json.gz` (`?format=gzip` or `?format=gz`) |
+| `POST` | `/api/v1/backup/import` | Admin | Restores plain `.json` or `.json.gz` backup (`256 MiB` max raw / `512 MiB` max decoded; v0/v1/v2), reloads active monitors, and returns `{"ok":true,"monitors":N,"heartbeats":N,"daily_rollups":N}` |
+| `POST` | `/api/v1/backup/s3/test` | Admin | Tests S3 connectivity (`ListObjectsV2`) using saved settings or optional override fields (`s3_endpoint`, `s3_region`, `s3_bucket`, `s3_prefix`, `s3_access_key_id`, `s3_secret_access_key`, `s3_force_path_style`; `"********"` or omitted keeps saved secret). Returns `{"ok":true}` |
+| `POST` | `/api/v1/backup/s3/run` | Admin | Uploads an immediate gzipped Backup v2 archive to S3 and prunes oldest objects beyond `s3_retention_count`. Returns `{"key","size","uploaded_at","pruned","monitors","heartbeats","daily_rollups"}` |
+| `GET` | `/api/v1/backup/s3/list` | Admin | Lists `.json.gz` and `.json` backup objects under `s3_prefix`, sorted newest first (`[{"key","size","last_modified"}]`) |
+| `POST` | `/api/v1/backup/s3/restore` | Admin | Body: `{"key":"..."}`. Downloads and imports the specified S3 backup object, reloads active monitors, and returns `{"ok":true,"monitors":N,"heartbeats":N,"daily_rollups":N}` |
+| `DELETE` | `/api/v1/backup/s3/object` | Admin | Deletes an S3 backup object specified by `?key=...` query param or JSON body `{"key":"..."}`. Returns `{"ok":true}` |
 
 ---
 
@@ -393,10 +415,17 @@ curl -fsS -H "Authorization: Bearer YOUR_METRICS_TOKEN" \
   "https://status.example.com/metrics"
 ```
 
-Export a JSON backup:
+Export a compressed full-history backup (or omit `?format=gzip` for plain JSON):
 
 ```sh
 curl -fsS -H "Authorization: Bearer exa_YOUR_API_KEY" \
-  -o exa-backup.json \
-  "https://status.example.com/api/v1/backup/export"
+  -o exa-backup.json.gz \
+  "https://status.example.com/api/v1/backup/export?format=gzip"
+```
+
+Trigger an immediate S3 remote backup:
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer exa_YOUR_API_KEY" \
+  "https://status.example.com/api/v1/backup/s3/run"
 ```

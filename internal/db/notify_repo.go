@@ -390,7 +390,54 @@ func (s *Store) ExportBackup() (*model.BackupData, error) {
 		return nil, err
 	}
 
-	incidents, err := s.ListIncidents("", 10000, 0)
+	hbRows, err := s.db.Query(
+		`SELECT id, monitor_id, status, latency_ms, status_code, message, checked_at
+		 FROM heartbeats ORDER BY id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer hbRows.Close()
+	heartbeats := []model.Heartbeat{}
+	for hbRows.Next() {
+		var h model.Heartbeat
+		var st, checkedStr string
+		if err := hbRows.Scan(&h.ID, &h.MonitorID, &st, &h.LatencyMs, &h.StatusCode, &h.Message, &checkedStr); err != nil {
+			return nil, err
+		}
+		h.Status = model.HeartbeatStatus(st)
+		h.CheckedAt = parseTime(checkedStr)
+		heartbeats = append(heartbeats, h)
+	}
+	if err := hbRows.Err(); err != nil {
+		return nil, err
+	}
+
+	ruRows, err := s.db.Query(
+		`SELECT monitor_id, day, total_checks, up_checks, degraded_checks, down_checks,
+		        sum_latency_ms, min_latency_ms, max_latency_ms, downtime_sec
+		 FROM daily_rollups ORDER BY monitor_id ASC, day ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer ruRows.Close()
+	dailyRollups := []model.BackupDailyRollup{}
+	for ruRows.Next() {
+		var ru model.BackupDailyRollup
+		if err := ruRows.Scan(
+			&ru.MonitorID, &ru.Day, &ru.TotalChecks, &ru.UpChecks, &ru.DegradedChecks,
+			&ru.DownChecks, &ru.SumLatencyMs, &ru.MinLatencyMs, &ru.MaxLatencyMs, &ru.DowntimeSec,
+		); err != nil {
+			return nil, err
+		}
+		dailyRollups = append(dailyRollups, ru)
+	}
+	if err := ruRows.Err(); err != nil {
+		return nil, err
+	}
+
+	incidents, err := s.ListIncidents("", 1000000, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -404,11 +451,13 @@ func (s *Store) ExportBackup() (*model.BackupData, error) {
 	}
 
 	return &model.BackupData{
-		Version:              1,
+		Version:              2,
 		ExportedAt:           time.Now().UTC(),
 		Settings:             settings,
 		ComponentGroups:      groups,
 		Monitors:             monitors,
+		Heartbeats:           heartbeats,
+		DailyRollups:         dailyRollups,
 		StatusPages:          pages,
 		StatusPageMonitors:   spmList,
 		NotificationChannels: channels,
@@ -420,7 +469,7 @@ func (s *Store) ExportBackup() (*model.BackupData, error) {
 }
 
 func (s *Store) ImportBackup(data model.BackupData) error {
-	if data.Version != 0 && data.Version != 1 {
+	if data.Version != 0 && data.Version != 1 && data.Version != 2 {
 		return fmt.Errorf("unsupported backup version: %d", data.Version)
 	}
 
@@ -430,6 +479,7 @@ func (s *Store) ImportBackup(data model.BackupData) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Preserve user accounts, sessions, and API keys while restoring all monitoring and status page data.
 	clearTables := []string{
 		"monitor_notifications",
 		"maintenance_monitors",
@@ -441,6 +491,8 @@ func (s *Store) ImportBackup(data model.BackupData) error {
 		"status_page_monitors",
 		"status_pages",
 		"notification_channels",
+		"heartbeats",
+		"daily_rollups",
 		"monitors",
 		"component_groups",
 		"settings",
@@ -516,6 +568,55 @@ func (s *Store) ImportBackup(data model.BackupData) error {
 			formatNullTime(m.LastCheckedAt), nullableInt(m.LastLatencyMs), formatNullTime(m.TLSExpiresAt),
 			nullableInt(m.TLSDaysLeft), m.LastError, formatTime(m.CreatedAt), formatTime(m.UpdatedAt),
 		); err != nil {
+			return err
+		}
+	}
+
+	if len(data.Heartbeats) > 0 {
+		hbStmt, err := tx.Prepare(
+			`INSERT INTO heartbeats (id, monitor_id, status, latency_ms, status_code, message, checked_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		)
+		if err != nil {
+			return err
+		}
+		for _, h := range data.Heartbeats {
+			if h.Status != model.HeartbeatStatusUp && h.Status != model.HeartbeatStatusDegraded && h.Status != model.HeartbeatStatusDown {
+				continue
+			}
+			var idArg any
+			if h.ID > 0 {
+				idArg = h.ID
+			}
+			if _, err := hbStmt.Exec(idArg, h.MonitorID, string(h.Status), h.LatencyMs, h.StatusCode, h.Message, formatTime(h.CheckedAt)); err != nil {
+				_ = hbStmt.Close()
+				return err
+			}
+		}
+		if err := hbStmt.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.DailyRollups) > 0 {
+		ruStmt, err := tx.Prepare(
+			`INSERT INTO daily_rollups
+			 (monitor_id, day, total_checks, up_checks, degraded_checks, down_checks, sum_latency_ms, min_latency_ms, max_latency_ms, downtime_sec)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		if err != nil {
+			return err
+		}
+		for _, ru := range data.DailyRollups {
+			if _, err := ruStmt.Exec(
+				ru.MonitorID, ru.Day, ru.TotalChecks, ru.UpChecks, ru.DegradedChecks,
+				ru.DownChecks, ru.SumLatencyMs, ru.MinLatencyMs, ru.MaxLatencyMs, ru.DowntimeSec,
+			); err != nil {
+				_ = ruStmt.Close()
+				return err
+			}
+		}
+		if err := ruStmt.Close(); err != nil {
 			return err
 		}
 	}

@@ -758,7 +758,7 @@ export function MonitorFormModal({
                 </label>
               ))}
             </div>
-            <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--ops-text-secondary)' }}>
+            <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
               Default channels are pre-selected for new monitors. Leaving all unchecked uses all enabled Default channels automatically.
             </p>
           </div>

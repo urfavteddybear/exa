@@ -190,6 +190,44 @@ func (s *Store) IsMonitorOnPublicStatusPage(monitorID string) (bool, error) {
 	return count > 0, nil
 }
 
+func (s *Store) ListPublicPagesForMonitor(monitorID string) ([]model.PublicMonitorPageBinding, error) {
+	rows, err := s.db.Query(
+		`SELECT sp.id, sp.slug, sp.title, sp.description, sp.custom_css, sp.is_default, sp.is_public, sp.show_latency, sp.created_at, sp.updated_at, spm.display_name
+		 FROM status_page_monitors spm
+		 JOIN status_pages sp ON sp.id = spm.status_page_id
+		 WHERE spm.monitor_id = ? AND sp.is_public = 1
+		 ORDER BY sp.is_default DESC, sp.created_at ASC`,
+		monitorID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []model.PublicMonitorPageBinding{}
+	for rows.Next() {
+		var p model.StatusPage
+		var isDef, isPub, showLat int
+		var createdStr, updatedStr, displayName string
+		if err := rows.Scan(
+			&p.ID, &p.Slug, &p.Title, &p.Description, &p.CustomCSS,
+			&isDef, &isPub, &showLat, &createdStr, &updatedStr, &displayName,
+		); err != nil {
+			return nil, err
+		}
+		p.IsDefault = isDef == 1
+		p.IsPublic = isPub == 1
+		p.ShowLatency = showLat == 1
+		p.CreatedAt = parseTime(createdStr)
+		p.UpdatedAt = parseTime(updatedStr)
+		out = append(out, model.PublicMonitorPageBinding{
+			Page:        p,
+			DisplayName: displayName,
+		})
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) IsMonitorOnStatusPage(pageID, monitorID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(

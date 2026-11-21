@@ -413,3 +413,62 @@ func TestManager_ReloadAndRemove(t *testing.T) {
 		t.Fatal("expected worker to be removed after RemoveMonitor")
 	}
 }
+
+func TestManager_FastRetriesAlertQuickly(t *testing.T) {
+	store := newTestStore(t)
+	bus := &spyBroadcaster{}
+	notif := &spyNotifier{}
+
+	mon, err := store.CreateMonitor(model.Monitor{
+		Name:        "Fast Retry API",
+		Type:        model.MonitorTypeHTTP,
+		Target:      "http://example.invalid",
+		IntervalSec: 60,
+		Retries:     2,
+		Active:      true,
+	})
+	if err != nil {
+		t.Fatalf("create monitor: %v", err)
+	}
+
+	var calls atomic.Int32
+	mgr := NewManager(store, notif, bus)
+	mgr.retryInterval = 20 * time.Millisecond
+	mgr.probeFn = func(_ context.Context, _ model.Monitor) model.ProbeResult {
+		calls.Add(1)
+		return model.ProbeResult{
+			Status:    model.HeartbeatStatusDown,
+			Message:   "connection refused",
+			CheckedAt: time.Now().UTC(),
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	mgr.Start(ctx)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(notif.snapshot()) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	mgr.Stop()
+
+	snaps := notif.snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 outage notification within 500ms, got %d (calls=%d)", len(snaps), calls.Load())
+	}
+	if snaps[0].MonitorID != mon.ID || snaps[0].Next != model.ComponentStatusMajorOutage {
+		t.Fatalf("unexpected notification payload: %+v", snaps[0])
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("expected fast retry outage confirmation < 500ms, took %v", elapsed)
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("expected at least 3 probe calls (initial + 2 retries), got %d", calls.Load())
+	}
+}

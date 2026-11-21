@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"exa/internal/backup"
 	"exa/internal/db"
 	"exa/internal/model"
 	"exa/internal/probe"
@@ -17,6 +18,8 @@ import (
 const (
 	defaultHousekeepingInterval = 30 * time.Second
 	defaultPruneInterval        = 1 * time.Hour
+	defaultRetryInterval        = 5 * time.Second
+	defaultS3AttemptCooldown    = 10 * time.Minute
 	defaultRetentionDays        = 30
 )
 
@@ -34,14 +37,17 @@ type Manager struct {
 
 	housekeepingInterval time.Duration
 	pruneInterval        time.Duration
+	retryInterval        time.Duration
 
-	mu        sync.Mutex
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stopping  bool
-	wg        sync.WaitGroup
-	workers   map[string]*workerHandle
-	lastPrune time.Time
+	mu              sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	stopping        bool
+	wg              sync.WaitGroup
+	workers         map[string]*workerHandle
+	lastPrune       time.Time
+	s3BackupRunning bool
+	s3LastAttempt   time.Time
 }
 
 // NewManager creates a Manager ready to be started.
@@ -53,6 +59,7 @@ func NewManager(store *db.Store, notifier model.Notifier, bus model.EventBroadca
 		probeFn:              probe.Probe,
 		housekeepingInterval: defaultHousekeepingInterval,
 		pruneInterval:        defaultPruneInterval,
+		retryInterval:        defaultRetryInterval,
 		workers:              make(map[string]*workerHandle),
 	}
 }
@@ -248,14 +255,18 @@ func (m *Manager) runWorker(ctx context.Context, mon model.Monitor, done chan st
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
+	retryInterval := m.retryInterval
+	if retryInterval <= 0 {
+		retryInterval = defaultRetryInterval
+	}
 
 	prevStatus := mon.CurrentStatus
 	consecutiveDown := 0
 
-	runOnce := func() {
+	runOnce := func() time.Duration {
 		res := m.probeFn(ctx, mon)
 		if ctx.Err() != nil {
-			return
+			return interval
 		}
 		if res.CheckedAt.IsZero() {
 			res.CheckedAt = time.Now().UTC()
@@ -285,24 +296,31 @@ func (m *Manager) runWorker(ctx context.Context, mon model.Monitor, done chan st
 
 		if err := m.store.RecordHeartbeat(ctx, mon.ID, res, finalStatus, mon.IntervalSec); err != nil {
 			slog.Error("record heartbeat failed", "monitor_id", mon.ID, "monitor", mon.Name, "err", err)
-			return
+			return interval
 		}
 
 		m.emitHeartbeatEvents(ctx, mon, res, prevStatus, finalStatus, inMaint && suppressAlerts)
 		prevStatus = finalStatus
+
+		if consecutiveDown > 0 && consecutiveDown <= mon.Retries {
+			if retryInterval < interval {
+				return retryInterval
+			}
+		}
+		return interval
 	}
 
-	runOnce()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	nextDelay := runOnce()
+	timer := time.NewTimer(nextDelay)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			runOnce()
+		case <-timer.C:
+			nextDelay = runOnce()
+			timer.Reset(nextDelay)
 		}
 	}
 }
@@ -351,6 +369,66 @@ func (m *Manager) runHousekeepingOnce(ctx context.Context, now time.Time) {
 		_, _ = m.store.PruneHeartbeats(cutoff)
 		_ = m.store.CleanExpiredSessions()
 	}
+
+	m.maybeRunScheduledS3Backup(ctx, now)
+}
+
+func (m *Manager) maybeRunScheduledS3Backup(ctx context.Context, now time.Time) {
+	settings, err := m.store.GetAllSettings()
+	if err != nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(settings["s3_enabled"]), "true") {
+		return
+	}
+	schedDur := backup.ScheduleInterval(settings["s3_schedule"])
+	if schedDur <= 0 {
+		return
+	}
+
+	if rawLast := strings.TrimSpace(settings["s3_last_backup_at"]); rawLast != "" {
+		if lastBackupAt, parseErr := time.Parse(time.RFC3339, rawLast); parseErr == nil {
+			if now.Sub(lastBackupAt.UTC()) < schedDur {
+				return
+			}
+		}
+	}
+
+	cfg := backup.LoadS3ConfigFromSettings(settings)
+
+	m.mu.Lock()
+	if m.stopping || m.ctx == nil || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
+	if m.s3BackupRunning || (!m.s3LastAttempt.IsZero() && now.Sub(m.s3LastAttempt) < defaultS3AttemptCooldown) {
+		m.mu.Unlock()
+		return
+	}
+	m.s3BackupRunning = true
+	m.s3LastAttempt = now
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		defer func() {
+			m.mu.Lock()
+			m.s3BackupRunning = false
+			m.mu.Unlock()
+		}()
+
+		bCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+
+		slog.Info("starting scheduled S3 backup", "bucket", cfg.Bucket, "schedule", cfg.Schedule)
+		res, runErr := backup.RunS3Backup(bCtx, m.store, cfg)
+		if runErr != nil {
+			slog.Error("scheduled S3 backup failed", "error", runErr)
+			return
+		}
+		slog.Info("scheduled S3 backup completed", "key", res.Key, "size", res.Size, "pruned", res.Pruned)
+	}()
 }
 
 func (m *Manager) checkPushWatchdog(ctx context.Context, now time.Time) {

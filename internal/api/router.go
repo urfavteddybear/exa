@@ -154,6 +154,11 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux.HandleFunc("PUT /api/v1/settings", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handlePutSettings))
 	mux.HandleFunc("GET /api/v1/backup/export", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleExportBackup))
 	mux.HandleFunc("POST /api/v1/backup/import", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleImportBackup))
+	mux.HandleFunc("POST /api/v1/backup/s3/test", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleS3Test))
+	mux.HandleFunc("POST /api/v1/backup/s3/run", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleS3Run))
+	mux.HandleFunc("GET /api/v1/backup/s3/list", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleS3List))
+	mux.HandleFunc("POST /api/v1/backup/s3/restore", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleS3Restore))
+	mux.HandleFunc("DELETE /api/v1/backup/s3/object", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleS3Delete))
 
 	// API 404 fallback and SPA static asset fallback.
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -555,6 +560,7 @@ func (rt *router) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "get settings failed", err)
 		return
 	}
+	maskSensitiveSettings(settings)
 	writeJSON(w, http.StatusOK, settings)
 }
 
@@ -564,9 +570,41 @@ func (rt *router) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	if rawSched, ok := body["s3_schedule"]; ok {
+		sched := strings.ToLower(strings.TrimSpace(rawSched))
+		switch sched {
+		case "", "off", "hourly", "daily", "weekly":
+		default:
+			writeError(w, http.StatusBadRequest, "s3_schedule must be off, hourly, daily, or weekly")
+			return
+		}
+		if sched == "" {
+			sched = "off"
+		}
+		body["s3_schedule"] = sched
+	}
+
+	if rawRet, ok := body["s3_retention_count"]; ok {
+		trimmed := strings.TrimSpace(rawRet)
+		if trimmed != "" {
+			n, err := strconv.Atoi(trimmed)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "s3_retention_count must be a non-negative integer")
+				return
+			}
+			body["s3_retention_count"] = strconv.Itoa(n)
+		}
+	}
+
 	for k, v := range body {
-		if k == "setup_completed" {
+		switch k {
+		case "setup_completed", "s3_last_backup_at", "s3_last_backup_key", "s3_last_error":
 			continue
+		case "s3_secret_access_key":
+			if strings.TrimSpace(v) == "" || v == "********" {
+				continue
+			}
 		}
 		if err := rt.cfg.Store.SetSetting(k, v); err != nil {
 			writeInternalError(w, r, "save setting failed", err)
@@ -578,36 +616,14 @@ func (rt *router) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, "reload settings failed", err)
 		return
 	}
+	maskSensitiveSettings(settings)
 	writeJSON(w, http.StatusOK, settings)
 }
 
-func (rt *router) handleExportBackup(w http.ResponseWriter, r *http.Request) {
-	data, err := rt.cfg.Store.ExportBackup()
-	if err != nil {
-		writeInternalError(w, r, "export backup failed", err)
-		return
+func maskSensitiveSettings(settings map[string]string) {
+	if settings["s3_secret_access_key"] != "" {
+		settings["s3_secret_access_key"] = "********"
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", `attachment; filename="exa-backup.json"`)
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(data)
-}
-
-func (rt *router) handleImportBackup(w http.ResponseWriter, r *http.Request) {
-	var data model.BackupData
-	dec := json.NewDecoder(io.LimitReader(r.Body, 10<<20))
-	if err := dec.Decode(&data); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid backup JSON")
-		return
-	}
-	if err := rt.cfg.Store.ImportBackup(data); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if rt.cfg.Monitors != nil {
-		rt.cfg.Monitors.ReloadAll()
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (rt *router) handleSPA(w http.ResponseWriter, r *http.Request) {

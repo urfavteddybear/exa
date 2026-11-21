@@ -3,13 +3,16 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -943,5 +946,374 @@ func TestSecurityHardening(t *testing.T) {
 	})
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 on 11th login attempt, got %d", rec.Code)
+	}
+}
+
+func TestBackupGzipAndS3Endpoints(t *testing.T) {
+	h, store, _, _, _ := setupTestAPI(t)
+
+	// Setup admin + viewer.
+	rec := doReq(t, h, http.MethodPost, "/api/v1/setup", map[string]string{
+		"username":   "admin",
+		"email":      "admin@exa.local",
+		"password":   "password123",
+		"site_title": "Exa S3",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup: %d %s", rec.Code, rec.Body.String())
+	}
+	adminCookie := rec.Result().Cookies()[0]
+
+	rec = doReq(t, h, http.MethodPost, "/api/v1/users", map[string]string{
+		"username": "viewer",
+		"password": "viewer-pass-123",
+		"role":     "viewer",
+	}, adminCookie)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create viewer: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doReq(t, h, http.MethodPost, "/api/v1/auth/login", map[string]string{
+		"username": "viewer",
+		"password": "viewer-pass-123",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login viewer: %d %s", rec.Code, rec.Body.String())
+	}
+	viewerCookie := rec.Result().Cookies()[0]
+
+	// Create monitor + heartbeats + rollups.
+	rec = doReq(t, h, http.MethodPost, "/api/v1/monitors", map[string]any{
+		"name":         "Edge API",
+		"slug":         "edge-api",
+		"type":         "http",
+		"target":       "https://edge.example.com/health",
+		"interval_sec": 60,
+	}, adminCookie)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create monitor: %d %s", rec.Code, rec.Body.String())
+	}
+	var mon model.Monitor
+	_ = json.Unmarshal(rec.Body.Bytes(), &mon)
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		if err := store.RecordHeartbeat(ctx, mon.ID, model.ProbeResult{
+			Status:     model.HeartbeatStatusUp,
+			LatencyMs:  20 + i*5,
+			StatusCode: 200,
+			Message:    "ok",
+			CheckedAt:  now.Add(-time.Duration(3-i) * time.Minute),
+		}, model.ComponentStatusOperational, 60); err != nil {
+			t.Fatalf("RecordHeartbeat %d: %v", i, err)
+		}
+	}
+
+	// 1. Gzip export + import preserving history and admin session.
+	rec = doReq(t, h, http.MethodGet, "/api/v1/backup/export?format=gzip", nil, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gzip export: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/gzip" {
+		t.Fatalf("expected application/gzip, got %q", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, ".json.gz") {
+		t.Fatalf("expected .json.gz attachment header, got %q", cd)
+	}
+
+	gzBytes := append([]byte(nil), rec.Body.Bytes()...)
+	gzReader, err := gzip.NewReader(bytes.NewReader(gzBytes))
+	if err != nil {
+		t.Fatalf("open gzip export: %v", err)
+	}
+	var exported model.BackupData
+	if err := json.NewDecoder(gzReader).Decode(&exported); err != nil {
+		t.Fatalf("decode gzip export: %v", err)
+	}
+	_ = gzReader.Close()
+	if len(exported.Heartbeats) != 3 || len(exported.DailyRollups) != 1 {
+		t.Fatalf("expected 3 heartbeats and 1 rollup in gzip backup, got hb=%d ru=%d", len(exported.Heartbeats), len(exported.DailyRollups))
+	}
+
+	// Wipe monitor + history, then restore from .json.gz payload.
+	if err := store.DeleteMonitor(mon.ID); err != nil {
+		t.Fatalf("DeleteMonitor: %v", err)
+	}
+	reqImport := httptest.NewRequest(http.MethodPost, "/api/v1/backup/import", bytes.NewReader(gzBytes))
+	reqImport.Header.Set("Content-Type", "application/gzip")
+	reqImport.AddCookie(adminCookie)
+	recImport := httptest.NewRecorder()
+	h.ServeHTTP(recImport, reqImport)
+	if recImport.Code != http.StatusOK {
+		t.Fatalf("gzip import: %d %s", recImport.Code, recImport.Body.String())
+	}
+	if !strings.Contains(recImport.Body.String(), `"heartbeats":3`) || !strings.Contains(recImport.Body.String(), `"daily_rollups":1`) {
+		t.Fatalf("unexpected import counts: %s", recImport.Body.String())
+	}
+
+	// Admin session still valid and history restored.
+	if recMe := doReq(t, h, http.MethodGet, "/api/v1/auth/me", nil, adminCookie); recMe.Code != http.StatusOK {
+		t.Fatalf("admin session lost after import: %d", recMe.Code)
+	}
+	restoredHBs, _ := store.ListHeartbeats(mon.ID, 10)
+	if len(restoredHBs) != 3 {
+		t.Fatalf("expected 3 restored heartbeats, got %d", len(restoredHBs))
+	}
+
+	// 2. Settings validation + s3_secret_access_key masking and preservation.
+	rec = doReq(t, h, http.MethodPut, "/api/v1/settings", map[string]string{
+		"s3_schedule": "every-minute",
+	}, adminCookie)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid s3_schedule, got %d", rec.Code)
+	}
+	rec = doReq(t, h, http.MethodPut, "/api/v1/settings", map[string]string{
+		"s3_retention_count": "-5",
+	}, adminCookie)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on negative s3_retention_count, got %d", rec.Code)
+	}
+
+	rec = doReq(t, h, http.MethodPut, "/api/v1/settings", map[string]string{
+		"s3_secret_access_key": "real-s3-secret-xyz",
+		"s3_schedule":          "daily",
+		"s3_retention_count":   "5",
+		"s3_last_error":        "should-be-ignored",
+	}, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save s3 settings: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "real-s3-secret-xyz") || !strings.Contains(rec.Body.String(), `"s3_secret_access_key":"********"`) {
+		t.Fatalf("expected masked s3 secret in PUT settings response, got %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "should-be-ignored") {
+		t.Fatalf("client should not overwrite s3_last_error: %s", rec.Body.String())
+	}
+
+	rec = doReq(t, h, http.MethodPut, "/api/v1/settings", map[string]string{
+		"s3_secret_access_key": "********",
+		"s3_retention_count":   "7",
+	}, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preserve s3 secret: %d %s", rec.Code, rec.Body.String())
+	}
+	storedSecret, _ := store.GetSetting("s3_secret_access_key")
+	if storedSecret != "real-s3-secret-xyz" {
+		t.Fatalf("expected stored secret preserved, got %q", storedSecret)
+	}
+	rec = doReq(t, h, http.MethodGet, "/api/v1/settings", nil, adminCookie)
+	if strings.Contains(rec.Body.String(), "real-s3-secret-xyz") || !strings.Contains(rec.Body.String(), `"s3_secret_access_key":"********"`) {
+		t.Fatalf("expected masked s3 secret in GET settings, got %s", rec.Body.String())
+	}
+
+	// Missing S3 endpoint/bucket returns 400 Bad Request on S3 run/restore.
+	if rec := doReq(t, h, http.MethodPost, "/api/v1/backup/s3/run", nil, adminCookie); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on unconfigured s3 run, got %d", rec.Code)
+	}
+	if rec := doReq(t, h, http.MethodPost, "/api/v1/backup/s3/restore", map[string]string{"key": ""}, adminCookie); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty restore key, got %d", rec.Code)
+	}
+
+	// 3. RBAC 403 for viewer on all 5 S3 endpoints.
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/backup/s3/test"},
+		{http.MethodPost, "/api/v1/backup/s3/run"},
+		{http.MethodGet, "/api/v1/backup/s3/list"},
+		{http.MethodPost, "/api/v1/backup/s3/restore"},
+		{http.MethodDelete, "/api/v1/backup/s3/object?key=prod/a.json.gz"},
+	} {
+		vRec := doReq(t, h, tc.method, tc.path, nil, viewerCookie)
+		if vRec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for viewer on %s %s, got %d", tc.method, tc.path, vRec.Code)
+		}
+	}
+}
+
+func TestS3EndpointsWithMockServer(t *testing.T) {
+	h, store, _, _, _ := setupTestAPI(t)
+
+	rec := doReq(t, h, http.MethodPost, "/api/v1/setup", map[string]string{
+		"username":   "admin",
+		"email":      "admin@exa.local",
+		"password":   "password123",
+		"site_title": "Exa S3",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup: %d %s", rec.Code, rec.Body.String())
+	}
+	adminCookie := rec.Result().Cookies()[0]
+
+	rec = doReq(t, h, http.MethodPost, "/api/v1/monitors", map[string]any{
+		"name":         "Edge API",
+		"slug":         "edge-api",
+		"type":         "http",
+		"target":       "https://edge.example.com/health",
+		"interval_sec": 60,
+	}, adminCookie)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create monitor: %d %s", rec.Code, rec.Body.String())
+	}
+	var mon model.Monitor
+	_ = json.Unmarshal(rec.Body.Bytes(), &mon)
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		if err := store.RecordHeartbeat(ctx, mon.ID, model.ProbeResult{
+			Status:     model.HeartbeatStatusUp,
+			LatencyMs:  20 + i*5,
+			StatusCode: 200,
+			Message:    "ok",
+			CheckedAt:  now.Add(-time.Duration(3-i) * time.Minute),
+		}, model.ComponentStatusOperational, 60); err != nil {
+			t.Fatalf("RecordHeartbeat %d: %v", i, err)
+		}
+	}
+
+	type mockObj struct {
+		data []byte
+		mod  time.Time
+	}
+	var s3Mu sync.Mutex
+	s3Objs := make(map[string]mockObj)
+	s3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		trimmed := strings.TrimPrefix(r.URL.Path, "/exa-bucket")
+		key := strings.TrimLeft(trimmed, "/")
+
+		s3Mu.Lock()
+		defer s3Mu.Unlock()
+
+		if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
+			prefix := r.URL.Query().Get("prefix")
+			type itemXML struct {
+				Key          string `xml:"Key"`
+				LastModified string `xml:"LastModified"`
+				Size         int64  `xml:"Size"`
+			}
+			type listXML struct {
+				XMLName     xml.Name  `xml:"ListBucketResult"`
+				IsTruncated bool      `xml:"IsTruncated"`
+				Contents    []itemXML `xml:"Contents"`
+			}
+			var keys []string
+			for k := range s3Objs {
+				if prefix == "" || strings.HasPrefix(k, prefix) {
+					keys = append(keys, k)
+				}
+			}
+			sort.Strings(keys)
+			out := listXML{}
+			for _, k := range keys {
+				obj := s3Objs[k]
+				out.Contents = append(out.Contents, itemXML{
+					Key:          k,
+					LastModified: obj.mod.UTC().Format(time.RFC3339),
+					Size:         int64(len(obj.data)),
+				})
+			}
+			w.Header().Set("Content-Type", "application/xml")
+			_ = xml.NewEncoder(w).Encode(out)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			s3Objs[key] = mockObj{data: b, mod: time.Now().UTC()}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			obj, ok := s3Objs[key]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(obj.data)
+		case http.MethodDelete:
+			delete(s3Objs, key)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer s3Srv.Close()
+
+	rec = doReq(t, h, http.MethodPut, "/api/v1/settings", map[string]string{
+		"s3_enabled":           "true",
+		"s3_endpoint":          s3Srv.URL,
+		"s3_region":            "us-east-1",
+		"s3_bucket":            "exa-bucket",
+		"s3_prefix":            "prod/",
+		"s3_access_key_id":     "AKIAEXATEST",
+		"s3_secret_access_key": "real-s3-secret-xyz",
+		"s3_force_path_style":  "true",
+		"s3_schedule":          "daily",
+		"s3_retention_count":   "5",
+	}, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save s3 settings: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 4. Test all 5 S3 endpoints as admin.
+	rec = doReq(t, h, http.MethodPost, "/api/v1/backup/s3/test", map[string]any{
+		"s3_secret_access_key": "********",
+	}, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("s3 test: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doReq(t, h, http.MethodPost, "/api/v1/backup/s3/run", nil, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("s3 run: %d %s", rec.Code, rec.Body.String())
+	}
+	var runRes model.S3BackupResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &runRes); err != nil {
+		t.Fatalf("unmarshal s3 run: %v", err)
+	}
+	if !strings.HasPrefix(runRes.Key, "prod/") || runRes.Heartbeats != 3 || runRes.DailyRollups != 1 {
+		t.Fatalf("unexpected s3 run result: %+v", runRes)
+	}
+
+	rec = doReq(t, h, http.MethodGet, "/api/v1/backup/s3/list", nil, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("s3 list: %d %s", rec.Code, rec.Body.String())
+	}
+	var objs []model.S3BackupObject
+	_ = json.Unmarshal(rec.Body.Bytes(), &objs)
+	if len(objs) != 1 || objs[0].Key != runRes.Key {
+		t.Fatalf("unexpected s3 list: %+v", objs)
+	}
+
+	// Delete monitor locally, then restore from S3.
+	_ = store.DeleteMonitor(mon.ID)
+	rec = doReq(t, h, http.MethodPost, "/api/v1/backup/s3/restore", map[string]string{
+		"key": runRes.Key,
+	}, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("s3 restore: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"heartbeats":3`) {
+		t.Fatalf("expected 3 restored heartbeats from S3, got %s", rec.Body.String())
+	}
+	if _, err := store.GetMonitorByID(mon.ID); err != nil {
+		t.Fatalf("expected monitor restored from S3: %v", err)
+	}
+
+	// Delete S3 object.
+	rec = doReq(t, h, http.MethodDelete, "/api/v1/backup/s3/object?key="+runRes.Key, nil, adminCookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("s3 delete: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doReq(t, h, http.MethodGet, "/api/v1/backup/s3/list", nil, adminCookie)
+	_ = json.Unmarshal(rec.Body.Bytes(), &objs)
+	if len(objs) != 0 {
+		t.Fatalf("expected empty s3 list after delete, got %+v", objs)
 	}
 }

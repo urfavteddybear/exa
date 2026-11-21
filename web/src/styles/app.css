@@ -1582,6 +1582,59 @@ textarea {
   margin-bottom: var(--space-2);
 }
 
+.chart-plot-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.chart-plot-wrap:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.chart-tooltip {
+  position: absolute;
+  top: 8px;
+  transform: translateX(10px);
+  pointer-events: none;
+  z-index: 20;
+  min-width: 172px;
+  max-width: 240px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-popover);
+  color: var(--text);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.chart-tooltip--left {
+  transform: translateX(calc(-100% - 10px));
+}
+
+.chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+}
+
+.chart-tooltip-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chart-tooltip-msg {
+  margin-top: 4px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
 /* Responsive State 1: Below 1024px stack Overview and Detail grids */
 @media (max-width: 1023px) {
   .overview-grid,
