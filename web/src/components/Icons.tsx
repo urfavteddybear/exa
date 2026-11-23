@@ -18,20 +18,6 @@ export function PulseLogoIcon({ size = 28 }: { size?: number }) {
   );
 }
 
-export function LogoMark() {
-  return (
-    <svg
-      width="7"
-      height="7"
-      viewBox="0 0 7 7"
-      aria-hidden="true"
-      style={{ display: 'inline-block', verticalAlign: 'baseline' }}
-    >
-      <rect width="7" height="7" fill="var(--accent)" />
-    </svg>
-  );
-}
-
 export function CheckCircleIcon({ size = 18, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 20 20" fill="none" aria-hidden="true" class={className}>

@@ -237,6 +237,12 @@ export function MonitorFormModal({
       return;
     }
 
+    // On edit, only send status_page_ids when the selection changed (order-insensitive); [] clears it.
+    const initialPages = new Set(initial?.status_page_ids || []);
+    const pagesChanged =
+      form.status_page_ids.length !== initialPages.size ||
+      form.status_page_ids.some((id) => !initialPages.has(id));
+
     setSaving(true);
     try {
       const payload = {
@@ -254,7 +260,13 @@ export function MonitorFormModal({
         config,
         notification_channel_ids: form.notification_channel_ids,
         attach_default_page: editingId ? undefined : form.attach_default_page,
-        status_page_ids: form.status_page_ids.length > 0 ? form.status_page_ids : undefined,
+        status_page_ids: editingId
+          ? pagesChanged
+            ? form.status_page_ids
+            : undefined
+          : form.status_page_ids.length > 0
+            ? form.status_page_ids
+            : undefined,
       };
       const saved = editingId
         ? await api.updateMonitor(editingId, payload)

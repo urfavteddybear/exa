@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -228,18 +229,6 @@ func (s *Store) ListPublicPagesForMonitor(monitorID string) ([]model.PublicMonit
 	return out, rows.Err()
 }
 
-func (s *Store) IsMonitorOnStatusPage(pageID, monitorID string) (bool, error) {
-	var count int
-	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM status_page_monitors WHERE status_page_id = ? AND monitor_id = ?`,
-		pageID, monitorID,
-	).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
 func (s *Store) ListStatusPageMonitors(pageID string) ([]model.StatusPageMonitor, error) {
 	rows, err := s.db.Query(
 		`SELECT status_page_id, monitor_id, group_id, display_name, sort_order
@@ -308,7 +297,15 @@ func (s *Store) AttachMonitorToPages(monitorID string, pageIDs []string, groupID
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(`DELETE FROM status_page_monitors WHERE monitor_id = ?`, monitorID); err != nil {
+	keep, err := json.Marshal(pageIDs)
+	if err != nil {
+		return err
+	}
+	// Only detach deselected pages so per-page display_name/group/sort survive an edit.
+	if _, err := tx.Exec(
+		`DELETE FROM status_page_monitors WHERE monitor_id = ? AND status_page_id NOT IN (SELECT value FROM json_each(?))`,
+		monitorID, string(keep),
+	); err != nil {
 		return err
 	}
 	for _, pid := range pageIDs {

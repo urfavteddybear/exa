@@ -443,3 +443,76 @@ func TestIncidentsMaintenancesChannelsAndBackup(t *testing.T) {
 		t.Fatalf("expected session deleted, got %v", err)
 	}
 }
+
+func TestAttachMonitorToPagesKeepsPerPageSettings(t *testing.T) {
+	s := openTestStore(t)
+	p1, err := s.CreateStatusPage(model.StatusPage{Slug: "p1", Title: "P1"})
+	if err != nil {
+		t.Fatalf("CreateStatusPage: %v", err)
+	}
+	p2, err := s.CreateStatusPage(model.StatusPage{Slug: "p2", Title: "P2"})
+	if err != nil {
+		t.Fatalf("CreateStatusPage: %v", err)
+	}
+	mon, err := s.CreateMonitor(model.Monitor{Name: "API", Type: model.MonitorTypePush, Active: true})
+	if err != nil {
+		t.Fatalf("CreateMonitor: %v", err)
+	}
+	if err := s.SetStatusPageMonitors(p1.ID, []model.StatusPageMonitor{{MonitorID: mon.ID, DisplayName: "Public API", SortOrder: 7}}); err != nil {
+		t.Fatalf("SetStatusPageMonitors: %v", err)
+	}
+
+	if err := s.AttachMonitorToPages(mon.ID, []string{p1.ID, p2.ID}, nil, 0); err != nil {
+		t.Fatalf("AttachMonitorToPages: %v", err)
+	}
+	items, _ := s.ListStatusPageMonitors(p1.ID)
+	if len(items) != 1 || items[0].DisplayName != "Public API" || items[0].SortOrder != 7 {
+		t.Fatalf("per-page settings lost: %+v", items)
+	}
+	if items, _ := s.ListStatusPageMonitors(p2.ID); len(items) != 1 {
+		t.Fatalf("expected monitor attached to p2, got %+v", items)
+	}
+
+	if err := s.AttachMonitorToPages(mon.ID, []string{}, nil, 0); err != nil {
+		t.Fatalf("AttachMonitorToPages clear: %v", err)
+	}
+	if ids, _ := s.ListStatusPageIDsForMonitor(mon.ID); len(ids) != 0 {
+		t.Fatalf("expected monitor detached from all pages, got %v", ids)
+	}
+}
+
+func TestRecordHeartbeatDowntimeUsesRealGapAndSkipsMaintenance(t *testing.T) {
+	s := openTestStore(t)
+	mon, err := s.CreateMonitor(model.Monitor{Name: "API", Type: model.MonitorTypePush, Active: true, IntervalSec: 300})
+	if err != nil {
+		t.Fatalf("CreateMonitor: %v", err)
+	}
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	rec := func(at time.Time, st model.HeartbeatStatus, final model.ComponentStatus) {
+		t.Helper()
+		if err := s.RecordHeartbeat(ctx, mon.ID, model.ProbeResult{Status: st, CheckedAt: at}, final, 300); err != nil {
+			t.Fatalf("RecordHeartbeat: %v", err)
+		}
+	}
+	rec(t0, model.HeartbeatStatusUp, model.ComponentStatusOperational)
+	// One normal interval down, then two 5s fast retries.
+	rec(t0.Add(300*time.Second), model.HeartbeatStatusDown, model.ComponentStatusOperational)
+	rec(t0.Add(305*time.Second), model.HeartbeatStatusDown, model.ComponentStatusOperational)
+	rec(t0.Add(310*time.Second), model.HeartbeatStatusDown, model.ComponentStatusMajorOutage)
+	// Down during maintenance must not count.
+	rec(t0.Add(610*time.Second), model.HeartbeatStatusDown, model.ComponentStatusMaintenance)
+
+	rus, err := s.GetDailyRollups(mon.ID, "2026-11-20", "2026-11-20")
+	if err != nil || len(rus) != 1 {
+		t.Fatalf("GetDailyRollups: %v %+v", err, rus)
+	}
+	ru := rus[0]
+	if ru.DowntimeSec != 310 {
+		t.Fatalf("expected 310s downtime (300 + 5 + 5), got %d", ru.DowntimeSec)
+	}
+	// Counted: the up check and the first down; the two 5s retries and the maintenance check are not.
+	if ru.TotalChecks != 2 || ru.DownChecks != 1 {
+		t.Fatalf("fast retries and maintenance must not count as checks: total=%d down=%d", ru.TotalChecks, ru.DownChecks)
+	}
+}

@@ -83,10 +83,11 @@ function channelToForm(ch: NotificationChannel): ChannelFormState {
   };
 }
 
+// Secret fields are always sent: "" clears the stored value, "********" keeps it.
 function buildChannelConfig(f: ChannelFormState): Record<string, unknown> {
   switch (f.type) {
     case 'webhook':
-      return { url: f.webhook_url.trim(), secret: f.webhook_secret.trim() || undefined };
+      return { url: f.webhook_url.trim(), secret: f.webhook_secret.trim() };
     case 'discord':
       return { webhook_url: f.webhook_url.trim(), username: f.discord_username.trim() || undefined };
     case 'slack':
@@ -98,7 +99,7 @@ function buildChannelConfig(f: ChannelFormState): Record<string, unknown> {
         smtp_host: f.smtp_host.trim(),
         smtp_port: Number(f.smtp_port) || 587,
         username: f.smtp_user.trim() || undefined,
-        password: f.smtp_pass || undefined,
+        password: f.smtp_pass,
         from: f.smtp_from.trim(),
         to: f.smtp_to
           .split(',')
@@ -110,7 +111,7 @@ function buildChannelConfig(f: ChannelFormState): Record<string, unknown> {
       return {
         server_url: f.ntfy_server_url.trim() || 'https://ntfy.sh',
         topic: f.ntfy_topic.trim(),
-        token: f.ntfy_token.trim() || undefined,
+        token: f.ntfy_token.trim(),
         priority: f.ntfy_priority || 'default',
       };
   }

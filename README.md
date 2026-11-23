@@ -51,15 +51,15 @@ Exa reads configuration from environment variables or matching CLI flags (`-port
 | `PORT` | `8080` | HTTP listen port |
 | `HOST` | `0.0.0.0` | HTTP listen address |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Directory for `exa.db` SQLite files |
-| `BASE_URL` | auto-detected from request | Public base URL used in feeds, push URLs, and unsubscribe links |
+| `BASE_URL` | auto-detected from request | Public base URL used in feeds, push URLs, and subscription confirm/unsubscribe links; required for public email subscriptions |
 | `COOKIE_SECURE` | `false` (`true` if `BASE_URL` uses `https://`) | Set `Secure` flag on `exa_session` cookies |
-| `TRUST_PROXY` | `false` | Trust `X-Forwarded-For` and `X-Forwarded-Proto` headers; enable only behind a proxy that overwrites them |
+| `TRUST_PROXY` | `false` | Trust `X-Forwarded-For` (rightmost entry) and `X-Forwarded-Proto` headers; enable only behind a reverse proxy |
 
 ## Security Defaults
 
 - Passwords for initial setup, admin-created users, and password changes require at least 10 characters.
 - Prometheus `/metrics` returns `401` until you configure `metrics_token` in Admin Settings.
-- Public status page subscriptions (`allow_subscriptions`) are disabled by default; enable them in Admin Settings when you want visitors to subscribe via email or HTTPS webhook.
+- Public status page subscriptions (`allow_subscriptions`) are disabled by default; enable them in Admin Settings when you want visitors to subscribe via email or HTTPS webhook. Email subscriptions need `BASE_URL` and an enabled email channel, and stay inactive until the visitor clicks the confirmation link; unconfirmed sign-ups are removed after 24 hours.
 - `docker-compose.yml` binds to `127.0.0.1:8080`, drops all Linux capabilities, sets `no-new-privileges:true`, and mounts the root filesystem read-only with `/data` and `/tmp` writable.
 - `docker-compose.yml` sets `net.ipv4.ping_group_range: "0 2147483647"` so unprivileged ICMP ping monitors work without `CAP_NET_RAW`. If you deploy with `network_mode: host` or in a runtime that restricts container `sysctls`, grant `cap_add: [NET_RAW]` instead.
 

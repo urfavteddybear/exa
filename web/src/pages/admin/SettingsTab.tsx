@@ -310,7 +310,7 @@ export function SettingsTab({ currentUser }: { currentUser: User }) {
       setCreatedToken(created.token);
       setCopiedToken(false);
       setKeyName('');
-      await loadAll();
+      setApiKeys((await api.listApiKeys()) || []);
     } catch (err) {
       setFeedback({
         kind: 'error',
@@ -322,7 +322,7 @@ export function SettingsTab({ currentUser }: { currentUser: User }) {
   const handleRevokeKey = async (id: string) => {
     try {
       await api.deleteApiKey(id);
-      await loadAll();
+      setApiKeys((await api.listApiKeys()) || []);
     } catch (err) {
       setFeedback({
         kind: 'error',
@@ -352,7 +352,7 @@ export function SettingsTab({ currentUser }: { currentUser: User }) {
       setNewEmail('');
       setNewUserPw('');
       setFeedback({ kind: 'success', msg: 'User created.' });
-      await loadAll();
+      setUsers((await api.listUsers()) || []);
     } catch (err) {
       setFeedback({
         kind: 'error',
@@ -364,7 +364,7 @@ export function SettingsTab({ currentUser }: { currentUser: User }) {
   const handleDeleteUser = async (id: string) => {
     try {
       await api.deleteUser(id);
-      await loadAll();
+      setUsers((await api.listUsers()) || []);
     } catch (err) {
       setFeedback({
         kind: 'error',

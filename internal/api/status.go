@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"exa/internal/db"
 	"exa/internal/model"
+	"exa/internal/notify"
 )
 
 func (rt *router) handlePublicStatusDefault(w http.ResponseWriter, r *http.Request) {
@@ -430,7 +432,15 @@ func (rt *router) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "type must be email or webhook")
 		return
 	}
+	var baseURL string
 	if req.Type == model.SubscriberTypeEmail {
+		// Confirmation links must not come from the request Host header, which a caller controls.
+		baseURL, _ = rt.cfg.Store.GetSetting("base_url")
+		baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		if baseURL == "" || rt.cfg.Notifier == nil {
+			writeError(w, http.StatusServiceUnavailable, "email subscriptions require BASE_URL to be configured")
+			return
+		}
 		if strings.ContainsAny(req.Endpoint, "\r\n") {
 			writeError(w, http.StatusBadRequest, "valid email address is required")
 			return
@@ -449,11 +459,12 @@ func (rt *router) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Email needs double opt-in so nobody can sign up someone else's inbox; webhooks are SSRF-checked instead.
 	sub, err := rt.cfg.Store.CreateSubscriber(model.Subscriber{
 		StatusPageID: pageObj.ID,
 		Type:         req.Type,
 		Endpoint:     req.Endpoint,
-		Verified:     true,
+		Verified:     req.Type != model.SubscriberTypeEmail,
 		Active:       true,
 	})
 	if err != nil {
@@ -461,9 +472,42 @@ func (rt *router) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !sub.Verified {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		confirmURL := baseURL + "/api/v1/subscribe/confirm/" + sub.Token
+		unsubURL := baseURL + "/api/v1/unsubscribe/" + sub.Token
+		if err := rt.cfg.Notifier.SendSubscriptionConfirmation(ctx, *pageObj, sub.Endpoint, confirmURL, unsubURL); err != nil {
+			slog.Warn("subscription confirmation email failed", "page_id", pageObj.ID, "subscriber_id", sub.ID, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "could not send confirmation email, try again later")
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id":                   sub.ID,
+			"message":              "Check your inbox to confirm your subscription",
+			"pending_confirmation": true,
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":      sub.ID,
 		"message": "Subscribed to status updates",
+	})
+}
+
+func (rt *router) handleConfirmSubscription(w http.ResponseWriter, r *http.Request) {
+	if err := rt.cfg.Store.ConfirmSubscriberByToken(r.PathValue("token")); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "subscription not found")
+			return
+		}
+		writeInternalError(w, r, "confirm subscription failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"message": "Your subscription is confirmed.",
 	})
 }
 
@@ -599,6 +643,24 @@ func (rt *router) handleDeleteStatusPage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (rt *router) handleListPageMonitors(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := rt.cfg.Store.GetStatusPageByID(id); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "status page not found")
+			return
+		}
+		writeInternalError(w, r, "status operation failed", err)
+		return
+	}
+	items, err := rt.cfg.Store.ListStatusPageMonitors(id)
+	if err != nil {
+		writeInternalError(w, r, "status operation failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (rt *router) handleSetPageMonitors(w http.ResponseWriter, r *http.Request) {
@@ -1090,7 +1152,7 @@ func (rt *router) validateSubscribeWebhook(ctx context.Context, raw string) erro
 		return errors.New("webhook host is not allowed")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if !isPublicRoutableIP(ip) {
+		if !notify.IsPublicRoutableIP(ip) {
 			return errors.New("webhook target IP is not allowed")
 		}
 		return nil
@@ -1110,7 +1172,7 @@ func (rt *router) validateSubscribeWebhook(ctx context.Context, raw string) erro
 		return errors.New("webhook host could not be resolved")
 	}
 	for _, ip := range ips {
-		if !isPublicRoutableIP(ip) {
+		if !notify.IsPublicRoutableIP(ip) {
 			return errors.New("webhook target IP is not allowed")
 		}
 	}
@@ -1129,31 +1191,6 @@ func isNumericHostTrick(host string) bool {
 		}
 	}
 	return allDigits
-}
-
-func isPublicRoutableIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
-		if ip[0] == 0 {
-			return false
-		}
-		// CGNAT 100.64.0.0/10.
-		if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
-			return false
-		}
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return false
-	}
-	// Explicit IPv6 ULA fc00::/7 check.
-	if len(ip) == net.IPv6len && ip.To4() == nil && (ip[0]&0xfe) == 0xfc {
-		return false
-	}
-	return true
 }
 
 var notificationSecretKeys = []string{"password", "bot_token", "secret", "token"}
@@ -1192,8 +1229,9 @@ func mergeNotificationSecrets(oldRaw, newRaw json.RawMessage) json.RawMessage {
 		if !hasOld || oldVal == "" {
 			continue
 		}
+		// Absent or masked keeps the stored secret; an explicit "" clears it.
 		newVal, hasNew := newMap[k].(string)
-		if !hasNew || newVal == "" || newVal == "********" {
+		if !hasNew || newVal == "********" {
 			newMap[k] = oldVal
 		}
 	}

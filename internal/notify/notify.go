@@ -8,13 +8,26 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"exa/internal/db"
 	"exa/internal/model"
 )
 
-const defaultNotifyTimeout = 10 * time.Second
+const (
+	defaultNotifyTimeout = 10 * time.Second
+	// Subscriber deliveries run off the probe goroutine; jobs are processed in order so DOWN never lands after UP.
+	subscriberQueueSize   = 256
+	subscriberConcurrency = 8
+)
+
+type subscriberJob struct {
+	pageID   string
+	subs     []model.Subscriber
+	payload  notificationPayload
+	emailCfg *model.EmailConfig
+}
 
 // Dispatcher routes monitor, incident, and maintenance notifications to channels and subscribers.
 type Dispatcher struct {
@@ -22,18 +35,23 @@ type Dispatcher struct {
 	client           *http.Client
 	subscriberClient *http.Client
 	telegramBaseURL  string
+	subQueue         chan subscriberJob
+	subPending       sync.WaitGroup
 }
 
 // NewDispatcher creates a Dispatcher backed by store.
 func NewDispatcher(store *db.Store) *Dispatcher {
-	return &Dispatcher{
+	d := &Dispatcher{
 		store: store,
 		client: &http.Client{
 			Timeout: defaultNotifyTimeout,
 		},
 		subscriberClient: newSubscriberHTTPClient(),
 		telegramBaseURL:  "https://api.telegram.org",
+		subQueue:         make(chan subscriberJob, subscriberQueueSize),
 	}
+	go d.runSubscriberQueue()
+	return d
 }
 
 func newSubscriberHTTPClient() *http.Client {
@@ -206,6 +224,28 @@ func (d *Dispatcher) NotifyMaintenanceUpdate(ctx context.Context, page model.Sta
 }
 
 // TestChannel sends a test notification through the provided channel configuration.
+// SendSubscriptionConfirmation emails a double opt-in link using the first enabled email channel.
+func (d *Dispatcher) SendSubscriptionConfirmation(ctx context.Context, page model.StatusPage, email, confirmURL, unsubscribeURL string) error {
+	channels, err := d.store.ListNotificationChannels()
+	if err != nil {
+		return err
+	}
+	cfg := firstEnabledEmailConfig(channels)
+	if cfg == nil {
+		return errors.New("no enabled email notification channel")
+	}
+	sub := *cfg
+	sub.To = []string{email}
+	return d.sendEmail(ctx, sub, notificationPayload{
+		Event: "subscription_confirmation",
+		Title: fmt.Sprintf("Confirm your subscription to %s", page.Title),
+		Message: fmt.Sprintf("Someone (hopefully you) asked to receive status updates for %s at this address.\n\nConfirm: %s\n\nIf this wasn't you, ignore this email or unsubscribe: %s",
+			page.Title, confirmURL, unsubscribeURL),
+		Severity:  "info",
+		Timestamp: time.Now().UTC(),
+	})
+}
+
 func (d *Dispatcher) TestChannel(ctx context.Context, ch model.NotificationChannel) error {
 	payload := notificationPayload{
 		Event:     "test",
@@ -239,7 +279,7 @@ func (d *Dispatcher) dispatchPageNotifications(ctx context.Context, pageID strin
 		}
 	}
 
-	d.deliverPageSubscribers(ctx, pageID, payload, emailCfg)
+	d.deliverPageSubscribers(pageID, payload, emailCfg)
 }
 
 func (d *Dispatcher) notifyPublicMonitorSubscribers(ctx context.Context, m model.Monitor, prev, next model.ComponentStatus) {
@@ -303,36 +343,72 @@ func (d *Dispatcher) notifyPublicMonitorSubscribers(ctx context.Context, m model
 			},
 		}
 
-		d.deliverSubscribersList(ctx, page.ID, subs, payload, emailCfg)
+		d.deliverSubscribersList(page.ID, subs, payload, emailCfg)
 	}
 }
 
-func (d *Dispatcher) deliverPageSubscribers(ctx context.Context, pageID string, payload notificationPayload, emailCfg *model.EmailConfig) {
+func (d *Dispatcher) deliverPageSubscribers(pageID string, payload notificationPayload, emailCfg *model.EmailConfig) {
 	subs, err := d.store.ListActiveSubscribers(pageID)
 	if err != nil {
 		slog.Error("list active subscribers failed", "page_id", pageID, "err", err)
 		return
 	}
-	d.deliverSubscribersList(ctx, pageID, subs, payload, emailCfg)
+	d.deliverSubscribersList(pageID, subs, payload, emailCfg)
 }
 
-func (d *Dispatcher) deliverSubscribersList(ctx context.Context, pageID string, subs []model.Subscriber, payload notificationPayload, emailCfg *model.EmailConfig) {
-	for _, sub := range subs {
-		switch sub.Type {
-		case model.SubscriberTypeWebhook:
-			if err := d.sendSubscriberWebhook(ctx, sub.Endpoint, payload); err != nil {
-				slog.Warn("subscriber webhook delivery failed", "page_id", pageID, "subscriber_id", sub.ID, "err", err)
-			}
-		case model.SubscriberTypeEmail:
-			if emailCfg != nil {
-				subEmail := *emailCfg
-				subEmail.To = []string{sub.Endpoint}
-				if err := d.sendEmail(ctx, subEmail, payload); err != nil {
-					slog.Warn("subscriber email delivery failed", "page_id", pageID, "subscriber_id", sub.ID, "err", err)
+// deliverSubscribersList queues delivery so slow or hostile subscriber endpoints never block the caller.
+func (d *Dispatcher) deliverSubscribersList(pageID string, subs []model.Subscriber, payload notificationPayload, emailCfg *model.EmailConfig) {
+	if len(subs) == 0 {
+		return
+	}
+	d.subPending.Add(1)
+	select {
+	case d.subQueue <- subscriberJob{pageID: pageID, subs: subs, payload: payload, emailCfg: emailCfg}:
+	default:
+		d.subPending.Done()
+		slog.Error("subscriber notification queue full, dropping event", "page_id", pageID, "event", payload.Event, "subscribers", len(subs))
+	}
+}
+
+func (d *Dispatcher) runSubscriberQueue() {
+	for job := range d.subQueue {
+		d.deliverSubscriberJob(job)
+		d.subPending.Done()
+	}
+}
+
+func (d *Dispatcher) deliverSubscriberJob(job subscriberJob) {
+	sem := make(chan struct{}, subscriberConcurrency)
+	var wg sync.WaitGroup
+	for _, sub := range job.subs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(sub model.Subscriber) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultNotifyTimeout)
+			defer cancel()
+			switch sub.Type {
+			case model.SubscriberTypeWebhook:
+				if err := d.sendSubscriberWebhook(ctx, sub.Endpoint, job.payload); err != nil {
+					slog.Warn("subscriber webhook delivery failed", "page_id", job.pageID, "subscriber_id", sub.ID, "err", err)
+				}
+			case model.SubscriberTypeEmail:
+				if job.emailCfg != nil {
+					subEmail := *job.emailCfg
+					subEmail.To = []string{sub.Endpoint}
+					payload := job.payload
+					if base, _ := d.store.GetSetting("base_url"); strings.TrimSpace(base) != "" && sub.Token != "" {
+						payload.Message += "\n\nUnsubscribe: " + strings.TrimRight(strings.TrimSpace(base), "/") + "/api/v1/unsubscribe/" + sub.Token
+					}
+					if err := d.sendEmail(ctx, subEmail, payload); err != nil {
+						slog.Warn("subscriber email delivery failed", "page_id", job.pageID, "subscriber_id", sub.ID, "err", err)
+					}
 				}
 			}
-		}
+		}(sub)
 	}
+	wg.Wait()
 }
 
 func firstEnabledEmailConfig(channels []model.NotificationChannel) *model.EmailConfig {

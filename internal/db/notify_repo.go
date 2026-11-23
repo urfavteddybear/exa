@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"exa/internal/model"
@@ -219,9 +220,11 @@ func (s *Store) CreateSubscriber(sub model.Subscriber) (*model.Subscriber, error
 		sub.StatusPageID, string(sub.Type), sub.Endpoint,
 	).Scan(&existingID)
 	if err == nil && existingID != "" {
+		// An already active+verified subscription stays verified; reactivating an unsubscribed
+		// one needs fresh confirmation when the caller asks for it, so nobody can re-subscribe someone else.
 		if _, err := s.db.Exec(
-			`UPDATE subscribers SET active = 1, verified = 1 WHERE id = ?`,
-			existingID,
+			`UPDATE subscribers SET verified = CASE WHEN active = 1 AND verified = 1 THEN 1 ELSE ? END, active = 1 WHERE id = ?`,
+			boolToInt(sub.Verified), existingID,
 		); err != nil {
 			return nil, err
 		}
@@ -245,6 +248,27 @@ func (s *Store) CreateSubscriber(sub model.Subscriber) (*model.Subscriber, error
 		return nil, err
 	}
 	return &sub, nil
+}
+
+func (s *Store) ConfirmSubscriberByToken(token string) error {
+	res, err := s.db.Exec(`UPDATE subscribers SET verified = 1 WHERE token = ? AND active = 1`, token)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PruneUnverifiedSubscribers drops confirmations nobody clicked so junk sign-ups can't fill the per-page cap.
+func (s *Store) PruneUnverifiedSubscribers(olderThan time.Time) error {
+	_, err := s.db.Exec(`DELETE FROM subscribers WHERE verified = 0 AND created_at < ?`, formatTime(olderThan))
+	return err
 }
 
 func (s *Store) DeactivateSubscriberByToken(token string) error {
@@ -345,6 +369,13 @@ func (s *Store) ExportBackup() (*model.BackupData, error) {
 	settings, err := s.GetAllSettings()
 	if err != nil {
 		return nil, err
+	}
+	// S3 credentials stay out of backups: the bucket would otherwise hold its own write key,
+	// and restoring an old backup would bring back rotated keys.
+	for k := range settings {
+		if isS3Setting(k) {
+			delete(settings, k)
+		}
 	}
 	groups, err := s.ListGroups()
 	if err != nil {
@@ -495,15 +526,20 @@ func (s *Store) ImportBackup(data model.BackupData) error {
 		"daily_rollups",
 		"monitors",
 		"component_groups",
-		"settings",
 	}
 	for _, tbl := range clearTables {
 		if _, err := tx.Exec("DELETE FROM " + tbl); err != nil {
 			return fmt.Errorf("clear %s: %w", tbl, err)
 		}
 	}
+	if _, err := tx.Exec(`DELETE FROM settings WHERE substr(key, 1, 3) != 's3_'`); err != nil {
+		return fmt.Errorf("clear settings: %w", err)
+	}
 
 	for k, v := range data.Settings {
+		if isS3Setting(k) {
+			continue
+		}
 		if k == "setup_completed" {
 			var userCount int
 			if err := tx.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount); err != nil {
@@ -742,4 +778,8 @@ func isValidImportChannelType(t model.NotificationType) bool {
 	default:
 		return false
 	}
+}
+
+func isS3Setting(key string) bool {
+	return strings.HasPrefix(key, "s3_")
 }

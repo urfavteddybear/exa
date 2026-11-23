@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"net/url"
 	"strconv"
@@ -65,7 +67,8 @@ func mustParseCIDRs(cidrs []string) []*net.IPNet {
 	return nets
 }
 
-func isPublicRoutableIP(ip net.IP) bool {
+// IsPublicRoutableIP is the single SSRF guard for subscriber webhooks, used at subscribe and dial time.
+func IsPublicRoutableIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
@@ -104,7 +107,7 @@ func subscriberDialContext(resolver *net.Resolver) func(ctx context.Context, net
 			return nil, fmt.Errorf("subscriber host %q resolved no IP addresses", host)
 		}
 		for _, ipAddr := range ips {
-			if !isPublicRoutableIP(ipAddr.IP) {
+			if !IsPublicRoutableIP(ipAddr.IP) {
 				return nil, fmt.Errorf("subscriber target %q resolves to non-public IP %s", host, ipAddr.IP.String())
 			}
 		}
@@ -125,7 +128,7 @@ func (d *Dispatcher) sendSubscriberWebhook(ctx context.Context, endpoint string,
 	if !strings.EqualFold(parsed.Scheme, "https") {
 		return errors.New("subscriber webhook url must use https")
 	}
-	if ip := net.ParseIP(parsed.Hostname()); ip != nil && !isPublicRoutableIP(ip) {
+	if ip := net.ParseIP(parsed.Hostname()); ip != nil && !IsPublicRoutableIP(ip) {
 		return fmt.Errorf("subscriber webhook target IP %s is not publicly routable", ip.String())
 	}
 
@@ -295,13 +298,17 @@ func (d *Dispatcher) sendEmail(ctx context.Context, cfg model.EmailConfig, paylo
 	if host == "" || cfg.SMTPPort <= 0 || strings.TrimSpace(cfg.From) == "" || len(cfg.To) == 0 {
 		return errors.New("email smtp_host, smtp_port, from, and to are required")
 	}
+	fromHeader := sanitizeHeader(strings.TrimSpace(cfg.From))
+	fromAddr, err := mail.ParseAddress(fromHeader)
+	if err != nil {
+		return fmt.Errorf("invalid email from address: %w", err)
+	}
 
 	addr := net.JoinHostPort(host, strconv.Itoa(cfg.SMTPPort))
 	dialer := &net.Dialer{Timeout: defaultNotifyTimeout}
 	tlsCfg := &tls.Config{ServerName: host}
 
 	var conn net.Conn
-	var err error
 	if cfg.UseTLS && cfg.SMTPPort == 465 {
 		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsCfg}
 		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
@@ -311,6 +318,12 @@ func (d *Dispatcher) sendEmail(ctx context.Context, cfg model.EmailConfig, paylo
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
 	}
+	// net/smtp ignores ctx after dial; a deadline keeps a stalled server from hanging the sender forever.
+	deadline := time.Now().Add(defaultNotifyTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetDeadline(deadline)
 
 	client, err := smtp.NewClient(conn, host)
 	if err != nil {
@@ -320,10 +333,11 @@ func (d *Dispatcher) sendEmail(ctx context.Context, cfg model.EmailConfig, paylo
 	defer client.Close()
 
 	if cfg.UseTLS && cfg.SMTPPort != 465 {
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err := client.StartTLS(tlsCfg); err != nil {
-				return fmt.Errorf("smtp starttls: %w", err)
-			}
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return errors.New("smtp server does not support STARTTLS but use_tls is enabled")
+		}
+		if err := client.StartTLS(tlsCfg); err != nil {
+			return fmt.Errorf("smtp starttls: %w", err)
 		}
 	}
 
@@ -334,8 +348,7 @@ func (d *Dispatcher) sendEmail(ctx context.Context, cfg model.EmailConfig, paylo
 		}
 	}
 
-	from := sanitizeHeader(cfg.From)
-	if err := client.Mail(from); err != nil {
+	if err := client.Mail(fromAddr.Address); err != nil {
 		return fmt.Errorf("smtp mail from: %w", err)
 	}
 	cleanTo := make([]string, 0, len(cfg.To))
@@ -359,9 +372,9 @@ func (d *Dispatcher) sendEmail(ctx context.Context, cfg model.EmailConfig, paylo
 	}
 
 	msg := strings.Join([]string{
-		"From: " + from,
+		"From: " + fromHeader,
 		"To: " + strings.Join(cleanTo, ", "),
-		"Subject: " + sanitizeHeader(payload.Title),
+		"Subject: " + mime.QEncoding.Encode("utf-8", sanitizeHeader(payload.Title)),
 		"Date: " + payload.Timestamp.UTC().Format(time.RFC1123Z),
 		"MIME-Version: 1.0",
 		"Content-Type: text/plain; charset=UTF-8",
@@ -392,7 +405,7 @@ func (d *Dispatcher) sendNtfy(ctx context.Context, cfg model.NtfyConfig, payload
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Title", payload.Title)
+	req.Header.Set("Title", mime.QEncoding.Encode("utf-8", sanitizeHeader(payload.Title)))
 	if strings.TrimSpace(cfg.Priority) != "" {
 		req.Header.Set("Priority", strings.TrimSpace(cfg.Priority))
 	}
@@ -427,6 +440,11 @@ func (d *Dispatcher) doJSONRequest(req *http.Request) error {
 func doRequestWithClient(client *http.Client, req *http.Request) error {
 	resp, err := client.Do(req)
 	if err != nil {
+		// url.Error embeds the full URL, which carries Telegram bot tokens and Discord/Slack webhook secrets.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return fmt.Errorf("%s request to %s failed: %w", urlErr.Op, req.URL.Host, urlErr.Err)
+		}
 		return err
 	}
 	defer resp.Body.Close()

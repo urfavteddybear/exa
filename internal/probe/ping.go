@@ -26,6 +26,8 @@ var (
 	reWinAvg    = regexp.MustCompile(`(?i)Average\s*=\s*(\d+)\s*ms`)
 	reUnixAvg   = regexp.MustCompile(`(?i)(?:rtt|round-trip)\s+min/avg/max(?:/[a-z]+)?\s*=\s*[\d.]+/([\d.]+)/`)
 	rePacketRTT = regexp.MustCompile(`(?i)time\s*([<=])\s*([\d.]+)\s*ms`)
+	// Localized Windows output ("Zeit=1ms", "temps=1 ms", "waktu<1ms") still ends each reply with "ms TTL=".
+	reReplyTTL = regexp.MustCompile(`(?i)([<=])\s*([\d.]+)\s*ms\s+TTL=`)
 )
 
 func probePing(ctx context.Context, m model.Monitor, timeout time.Duration) model.ProbeResult {
@@ -401,6 +403,9 @@ func parsePingOutput(output string) (int, bool) {
 	}
 
 	matches := rePacketRTT.FindAllStringSubmatch(output, -1)
+	if len(matches) == 0 {
+		matches = reReplyTTL.FindAllStringSubmatch(output, -1)
+	}
 	if len(matches) == 0 {
 		return 0, false
 	}

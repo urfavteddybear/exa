@@ -19,7 +19,10 @@ import (
 	"exa/internal/model"
 )
 
-const minPasswordLength = 10
+const (
+	minPasswordLength = 10
+	maxPasswordBytes  = 72 // bcrypt rejects longer input
+)
 
 type RouterConfig struct {
 	Store      *db.Store
@@ -36,7 +39,6 @@ type RouterConfig struct {
 type router struct {
 	cfg              RouterConfig
 	loginIPLimiter   *rateLimiter
-	loginUserLimiter *rateLimiter
 	setupLimiter     *rateLimiter
 	subscribeLimiter *rateLimiter
 	pushLimiter      *rateLimiter
@@ -58,7 +60,6 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	rt := &router{
 		cfg:              cfg,
 		loginIPLimiter:   newRateLimiter(10, 5*time.Minute),
-		loginUserLimiter: newRateLimiter(10, 5*time.Minute),
 		setupLimiter:     newRateLimiter(5, 10*time.Minute),
 		subscribeLimiter: newRateLimiter(5, 10*time.Minute),
 		pushLimiter:      newRateLimiter(120, 1*time.Minute),
@@ -97,6 +98,7 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux.HandleFunc("GET /api/v1/status/{slug}/incidents", rt.handlePublicIncidents)
 	mux.HandleFunc("POST /api/v1/status/{slug}/subscribe", rt.handleSubscribe)
 	mux.HandleFunc("GET /api/v1/unsubscribe/{token}", rt.handleUnsubscribe)
+	mux.HandleFunc("GET /api/v1/subscribe/confirm/{token}", rt.handleConfirmSubscription)
 
 	// Admin overview, monitors, and component groups.
 	mux.HandleFunc("GET /api/v1/overview", cfg.Auth.RequireAuth(model.UserRoleViewer, rt.handleOverview))
@@ -129,6 +131,7 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux.HandleFunc("POST /api/v1/status-pages", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleCreateStatusPage))
 	mux.HandleFunc("PUT /api/v1/status-pages/{id}", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleUpdateStatusPage))
 	mux.HandleFunc("DELETE /api/v1/status-pages/{id}", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleDeleteStatusPage))
+	mux.HandleFunc("GET /api/v1/status-pages/{id}/monitors", cfg.Auth.RequireAuth(model.UserRoleViewer, rt.handleListPageMonitors))
 	mux.HandleFunc("PUT /api/v1/status-pages/{id}/monitors", cfg.Auth.RequireAuth(model.UserRoleAdmin, rt.handleSetPageMonitors))
 
 	// Notifications and subscribers (admin only because channel configs and subscriber endpoints are sensitive).
@@ -301,8 +304,8 @@ func (rt *router) handleSetup(w http.ResponseWriter, r *http.Request) {
 	req.Username = strings.TrimSpace(req.Username)
 	req.Email = strings.TrimSpace(req.Email)
 	req.SiteTitle = strings.TrimSpace(req.SiteTitle)
-	if req.Username == "" || len(req.Password) < minPasswordLength {
-		writeError(w, http.StatusBadRequest, "username is required and password must be at least 10 characters")
+	if req.Username == "" || len(req.Password) < minPasswordLength || len(req.Password) > maxPasswordBytes {
+		writeError(w, http.StatusBadRequest, "username is required and password must be 10 to 72 bytes")
 		return
 	}
 
@@ -345,12 +348,9 @@ func (rt *router) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// No per-username limiter: anyone could use it to lock the real admin out. The per-IP limit plus
+	// bcrypt and a 10-character minimum keep online guessing impractical.
 	username := strings.TrimSpace(req.Username)
-	normUser := strings.ToLower(username)
-	if normUser != "" && !rt.loginUserLimiter.Allow(normUser) {
-		writeError(w, http.StatusTooManyRequests, "too many login attempts for account, try again later")
-		return
-	}
 
 	user, err := rt.cfg.Store.GetUserByUsername(username)
 	if err != nil {
@@ -404,8 +404,8 @@ func (rt *router) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if len(req.NewPassword) < minPasswordLength {
-		writeError(w, http.StatusBadRequest, "new password must be at least 10 characters")
+	if len(req.NewPassword) < minPasswordLength || len(req.NewPassword) > maxPasswordBytes {
+		writeError(w, http.StatusBadRequest, "new password must be 10 to 72 bytes")
 		return
 	}
 	if !auth.VerifyPassword(p.User.PasswordHash, req.CurrentPassword) {
@@ -507,8 +507,8 @@ func (rt *router) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Username = strings.TrimSpace(req.Username)
 	req.Email = strings.TrimSpace(req.Email)
-	if req.Username == "" || len(req.Password) < minPasswordLength {
-		writeError(w, http.StatusBadRequest, "username is required and password must be at least 10 characters")
+	if req.Username == "" || len(req.Password) < minPasswordLength || len(req.Password) > maxPasswordBytes {
+		writeError(w, http.StatusBadRequest, "username is required and password must be 10 to 72 bytes")
 		return
 	}
 	role := req.Role

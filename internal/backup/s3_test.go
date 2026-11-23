@@ -24,10 +24,10 @@ type mockS3Object struct {
 }
 
 type mockS3Server struct {
-	mu      sync.Mutex
-	bucket  string
-	objects map[string]mockS3Object
-	srv     *httptest.Server
+	mu       sync.Mutex
+	bucket   string
+	objects  map[string]mockS3Object
+	srv      *httptest.Server
 	lastAuth string
 }
 
@@ -201,6 +201,13 @@ func TestS3BackupRoundTripRetentionAndValidation(t *testing.T) {
 		lastModified: now.Add(-24 * time.Hour),
 	}
 	mock.mu.Unlock()
+	// A foreign JSON object sharing the prefix must never be pruned.
+	mock.mu.Lock()
+	mock.objects["prod/backups/other-app-config.json"] = mockS3Object{
+		data:         []byte("{}"),
+		lastModified: now.Add(-72 * time.Hour),
+	}
+	mock.mu.Unlock()
 
 	res, err := RunS3Backup(ctx, store, cfg)
 	if err != nil {
@@ -219,6 +226,12 @@ func TestS3BackupRoundTripRetentionAndValidation(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].Key != res.Key {
 		t.Fatalf("expected newest backup first and total 2 retained, got %+v", list)
+	}
+	mock.mu.Lock()
+	_, foreignKept := mock.objects["prod/backups/other-app-config.json"]
+	mock.mu.Unlock()
+	if !foreignKept {
+		t.Fatal("retention pruning deleted a non-Exa object")
 	}
 
 	// Wipe monitors and heartbeats, then restore from S3.

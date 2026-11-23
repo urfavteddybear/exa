@@ -33,6 +33,28 @@ function usePopoverDismiss(wrapRef: { current: HTMLDivElement | null }, pinned: 
   }, [wrapRef, pinned, onClose]);
 }
 
+// Roving tabindex: one tab stop per bar (last focused, else the most recent cell);
+// arrow keys / Home / End move focus between the cell buttons inside the group.
+function useRovingFocus(count: number) {
+  const [focusIdx, setFocusIdx] = useState<number | null>(null);
+  const current = focusIdx !== null && focusIdx < count ? focusIdx : count - 1;
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    const cells = Array.from((e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button'));
+    const pos = cells.indexOf(e.target as HTMLElement);
+    if (pos < 0) return;
+    e.preventDefault();
+    const next =
+      e.key === 'Home'
+        ? 0
+        : e.key === 'End'
+          ? cells.length - 1
+          : Math.min(cells.length - 1, Math.max(0, pos + (e.key === 'ArrowLeft' ? -1 : 1)));
+    cells[next].focus();
+  };
+  return { tabIndex: (idx: number) => (idx === current ? 0 : -1), setFocusIdx, onKeyDown };
+}
+
 function popoverPlacement(idx: number | null, total: number) {
   const rawPct = idx !== null && total > 0 ? ((idx + 0.5) / total) * 100 : 50;
   const cls =
@@ -58,6 +80,7 @@ export function UptimeBar({ monitorName, days, uptime90d }: UptimeBarProps) {
 
   usePopoverDismiss(wrapRef, pinnedIdx !== null, () => setPinnedIdx(null));
 
+  const roving = useRovingFocus(days.length);
   const activeIdx = pinnedIdx !== null ? pinnedIdx : hoverIdx;
   const activeDay = activeIdx !== null ? days[activeIdx] : null;
   const { cls, style } = popoverPlacement(activeIdx, days.length);
@@ -67,7 +90,12 @@ export function UptimeBar({ monitorName, days, uptime90d }: UptimeBarProps) {
 
   return (
     <div class="uptime-bar-wrap" ref={wrapRef}>
-      <div class="uptime-bars" role="group" aria-label={`90-day uptime history for ${monitorName}`}>
+      <div
+        class="uptime-bars"
+        role="group"
+        aria-label={`90-day uptime history for ${monitorName}`}
+        onKeyDown={roving.onKeyDown}
+      >
         {days.map((d, idx) => {
           const info = dayStatusInfo(d.status);
           const isPinned = pinnedIdx === idx;
@@ -82,6 +110,14 @@ export function UptimeBar({ monitorName, days, uptime90d }: UptimeBarProps) {
               class={`uptime-bar-seg uptime-bar-seg--${info.tone}`}
               aria-label={`${formatDayLabel(d.day)}: ${info.label}, ${pctStr}`}
               aria-expanded={isPinned}
+              tabIndex={roving.tabIndex(idx)}
+              onFocus={() => {
+                roving.setFocusIdx(idx);
+                if (pinnedIdx === null) setHoverIdx(idx);
+              }}
+              onBlur={() => {
+                if (pinnedIdx === null) setHoverIdx(null);
+              }}
               onMouseEnter={() => {
                 if (pinnedIdx === null) setHoverIdx(idx);
               }}
@@ -171,6 +207,7 @@ export function Availability60Bar({ buckets }: { buckets: OverviewBucket[] }) {
   usePopoverDismiss(wrapRef, pinnedIdx !== null, () => setPinnedIdx(null));
 
   const items = buckets || [];
+  const roving = useRovingFocus(items.length);
   const activeIdx = pinnedIdx !== null ? pinnedIdx : hoverIdx;
   const activeBucket = activeIdx !== null ? items[activeIdx] : null;
   const { cls, style } = popoverPlacement(activeIdx, items.length);
@@ -186,6 +223,7 @@ export function Availability60Bar({ buckets }: { buckets: OverviewBucket[] }) {
         style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}
         role="group"
         aria-label="Availability across all monitors over the last 24 hours"
+        onKeyDown={roving.onKeyDown}
       >
         {items.map((b, idx) => {
           const info = dayStatusInfo(b.status);
@@ -196,6 +234,14 @@ export function Availability60Bar({ buckets }: { buckets: OverviewBucket[] }) {
               class={`uptime-bar-seg uptime-bar-seg--${info.tone}`}
               aria-label={`${formatShortTime(b.timestamp)}: ${info.label}, ${b.total_checks} checks`}
               aria-expanded={pinnedIdx === idx}
+              tabIndex={roving.tabIndex(idx)}
+              onFocus={() => {
+                roving.setFocusIdx(idx);
+                if (pinnedIdx === null) setHoverIdx(idx);
+              }}
+              onBlur={() => {
+                if (pinnedIdx === null) setHoverIdx(null);
+              }}
               onMouseEnter={() => {
                 if (pinnedIdx === null) setHoverIdx(idx);
               }}
@@ -272,6 +318,7 @@ export function Heartbeat60Strip({
     ...checks.slice(-slots),
   ];
 
+  const roving = useRovingFocus(padded.length);
   const activeIdx = pinnedIdx !== null ? pinnedIdx : hoverIdx;
   const activeHb = activeIdx !== null ? padded[activeIdx] : null;
   const { cls, style } = popoverPlacement(activeIdx, padded.length);
@@ -283,6 +330,7 @@ export function Heartbeat60Strip({
         style={{ gridTemplateColumns: `repeat(${slots}, minmax(0, 1fr))` }}
         role="group"
         aria-label="Last 60 heartbeat checks"
+        onKeyDown={roving.onKeyDown}
       >
         {padded.map((hb, idx) => {
           if (!hb) {
@@ -303,6 +351,14 @@ export function Heartbeat60Strip({
               class={`uptime-bar-seg uptime-bar-seg--${info.tone}`}
               aria-label={`${formatShortTime(hb.checked_at)}: ${info.label}, ${hb.latency_ms} ms`}
               aria-expanded={pinnedIdx === idx}
+              tabIndex={roving.tabIndex(idx)}
+              onFocus={() => {
+                roving.setFocusIdx(idx);
+                if (pinnedIdx === null) setHoverIdx(idx);
+              }}
+              onBlur={() => {
+                if (pinnedIdx === null) setHoverIdx(null);
+              }}
               onMouseEnter={() => {
                 if (pinnedIdx === null) setHoverIdx(idx);
               }}
