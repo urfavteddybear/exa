@@ -71,6 +71,10 @@ func (n *spyNotifier) TestChannel(context.Context, model.NotificationChannel) er
 	return nil
 }
 
+func (n *spyNotifier) SendSubscriptionConfirmation(context.Context, model.StatusPage, string, string, string) error {
+	return nil
+}
+
 func (n *spyNotifier) snapshot() []stateChangeCall {
 	n.mu.Lock()
 	defer n.mu.Unlock()

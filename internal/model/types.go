@@ -421,6 +421,7 @@ type Notifier interface {
 	NotifyIncidentUpdate(ctx context.Context, page StatusPage, inc Incident, upd IncidentUpdate)
 	NotifyMaintenanceUpdate(ctx context.Context, page StatusPage, maint Maintenance)
 	TestChannel(ctx context.Context, ch NotificationChannel) error
+	SendSubscriptionConfirmation(ctx context.Context, page StatusPage, email, confirmURL, unsubscribeURL string) error
 }
 
 // Public status API and admin payloads.

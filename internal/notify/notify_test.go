@@ -412,6 +412,7 @@ func TestDispatcher_MonitorIncidentAndMaintenanceRouting(t *testing.T) {
 		ScheduledEnd:   time.Now().UTC().Add(2 * time.Hour),
 	}
 	d.NotifyMaintenanceUpdate(ctx, *page, maint)
+	d.subPending.Wait()
 
 	mu.Lock()
 	gotDefaultCount := len(events)
@@ -464,11 +465,11 @@ func TestIsPublicRoutableIP(t *testing.T) {
 		if ip == nil {
 			t.Fatalf("failed to parse IP %q", raw)
 		}
-		if isPublicRoutableIP(ip) {
+		if IsPublicRoutableIP(ip) {
 			t.Errorf("expected %q to be rejected as non-public IP", raw)
 		}
 	}
-	if isPublicRoutableIP(nil) {
+	if IsPublicRoutableIP(nil) {
 		t.Error("expected nil IP to be rejected")
 	}
 
@@ -484,7 +485,7 @@ func TestIsPublicRoutableIP(t *testing.T) {
 		if ip == nil {
 			t.Fatalf("failed to parse IP %q", raw)
 		}
-		if !isPublicRoutableIP(ip) {
+		if !IsPublicRoutableIP(ip) {
 			t.Errorf("expected %q to be allowed as public routable IP", raw)
 		}
 	}
@@ -679,6 +680,7 @@ func TestDispatcher_AdminVsPublicSubscriberMonitorAlerts(t *testing.T) {
 	// Maintenance and unknown -> operational must NOT notify public subscribers.
 	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusOperational, model.ComponentStatusMaintenance, "")
 	d.NotifyMonitorStateChange(ctx, *mon, model.ComponentStatusUnknown, model.ComponentStatusOperational, "")
+	d.subPending.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -787,5 +789,49 @@ func TestSendDiscord_TruncatesOversizedFieldsAndIncludesErrorBody(t *testing.T) 
 	})
 	if err == nil || !strings.Contains(err.Error(), "Invalid Form Body") {
 		t.Fatalf("expected HTTP 400 error body to surface, got: %v", err)
+	}
+}
+
+func TestDoRequestErrorRedactsURLSecrets(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:1/bot123456:SECRET/sendMessage", nil)
+	err := doRequestWithClient(&http.Client{Timeout: time.Second}, req)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("error leaks URL secret: %v", err)
+	}
+}
+
+func TestSendSubscriptionConfirmationEmail(t *testing.T) {
+	store, err := db.OpenPath(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+	d := NewDispatcher(store)
+	page := model.StatusPage{Title: "Acme Status"}
+
+	if err := d.SendSubscriptionConfirmation(context.Background(), page, "v@example.com", "https://s/confirm/t", "https://s/unsub/t"); err == nil {
+		t.Fatal("expected error without an email channel")
+	}
+
+	host, port, msgs, mu, closeSMTP := startMockSMTP(t)
+	defer closeSMTP()
+	if _, err := store.CreateNotificationChannel(model.NotificationChannel{
+		Name:    "smtp",
+		Type:    model.NotificationTypeEmail,
+		Config:  mustJSON(t, model.EmailConfig{SMTPHost: host, SMTPPort: port, From: "Exa Alerts <status@example.com>", To: []string{"admin@example.com"}}),
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("create email channel: %v", err)
+	}
+	if err := d.SendSubscriptionConfirmation(context.Background(), page, "v@example.com", "https://s/confirm/t", "https://s/unsub/t"); err != nil {
+		t.Fatalf("SendSubscriptionConfirmation: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*msgs) != 1 || !strings.Contains((*msgs)[0], "https://s/confirm/t") || !strings.Contains((*msgs)[0], "To: v@example.com") {
+		t.Fatalf("unexpected confirmation email: %v", *msgs)
 	}
 }

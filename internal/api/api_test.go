@@ -78,6 +78,7 @@ type mockNotifier struct {
 	incidentCalls int
 	maintCalls    int
 	testCalls     int
+	confirmURLs   []string
 	doneCh        chan struct{}
 }
 
@@ -100,6 +101,13 @@ func (n *mockNotifier) NotifyMaintenanceUpdate(ctx context.Context, page model.S
 	n.mu.Lock()
 	n.maintCalls++
 	n.mu.Unlock()
+}
+
+func (n *mockNotifier) SendSubscriptionConfirmation(ctx context.Context, page model.StatusPage, email, confirmURL, unsubscribeURL string) error {
+	n.mu.Lock()
+	n.confirmURLs = append(n.confirmURLs, confirmURL)
+	n.mu.Unlock()
+	return nil
 }
 
 func (n *mockNotifier) TestChannel(ctx context.Context, ch model.NotificationChannel) error {
@@ -316,12 +324,40 @@ func TestEndToEndAPIWorkflow(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enable allow_subscriptions: %d %s", rec.Code, rec.Body.String())
 	}
+	// Email subscriptions refuse to build confirmation links from the Host header.
 	rec = doReq(t, h, http.MethodPost, "/api/v1/status/default/subscribe", map[string]string{
 		"type":     "email",
 		"endpoint": "alerts@example.com",
 	})
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 without base_url, got %d %s", rec.Code, rec.Body.String())
+	}
+	if err := store.SetSetting("base_url", "https://status.example.com"); err != nil {
+		t.Fatalf("set base_url: %v", err)
+	}
+	rec = doReq(t, h, http.MethodPost, "/api/v1/status/default/subscribe", map[string]string{
+		"type":     "email",
+		"endpoint": "alerts@example.com",
+	})
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), "pending_confirmation") {
 		t.Fatalf("subscribe: %d %s", rec.Code, rec.Body.String())
+	}
+	notifier.mu.Lock()
+	if len(notifier.confirmURLs) != 1 || !strings.HasPrefix(notifier.confirmURLs[0], "https://status.example.com/api/v1/subscribe/confirm/") {
+		notifier.mu.Unlock()
+		t.Fatalf("expected one confirmation link, got %v", notifier.confirmURLs)
+	}
+	confirmPath := strings.TrimPrefix(notifier.confirmURLs[0], "https://status.example.com")
+	notifier.mu.Unlock()
+	if subs, _ := store.ListActiveSubscribers(pageID(t, store)); len(subs) != 0 {
+		t.Fatalf("unconfirmed subscriber must not receive notifications, got %d", len(subs))
+	}
+	rec = doReq(t, h, http.MethodGet, confirmPath, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("confirm: %d %s", rec.Code, rec.Body.String())
+	}
+	if subs, _ := store.ListActiveSubscribers(pageID(t, store)); len(subs) != 1 {
+		t.Fatalf("confirmed subscriber should be active, got %d", len(subs))
 	}
 
 	// 5. Metrics requires metrics_token to be configured and matched.
@@ -732,7 +768,6 @@ func TestSecurityHardening(t *testing.T) {
 			StartedAt: time.Now().UTC(),
 		},
 		loginIPLimiter:   newRateLimiter(10, 5*time.Minute),
-		loginUserLimiter: newRateLimiter(10, 5*time.Minute),
 		setupLimiter:     newRateLimiter(5, 10*time.Minute),
 		subscribeLimiter: newRateLimiter(100, 10*time.Minute),
 		pushLimiter:      newRateLimiter(120, 1*time.Minute),
@@ -1316,4 +1351,13 @@ func TestS3EndpointsWithMockServer(t *testing.T) {
 	if len(objs) != 0 {
 		t.Fatalf("expected empty s3 list after delete, got %+v", objs)
 	}
+}
+
+func pageID(t *testing.T, store *db.Store) string {
+	t.Helper()
+	p, err := store.GetDefaultStatusPage()
+	if err != nil {
+		t.Fatalf("GetDefaultStatusPage: %v", err)
+	}
+	return p.ID
 }

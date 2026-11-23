@@ -111,6 +111,25 @@ func (rt *router) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	// Cache the page's monitor set per connection so each event doesn't cost one DB query per viewer;
+	// it is refreshed on every keepalive to pick up newly attached monitors.
+	var pageMonitors map[string]bool
+	loadPageMonitors := func() {
+		if scopedPage == nil {
+			return
+		}
+		items, err := rt.cfg.Store.ListStatusPageMonitors(scopedPage.ID)
+		if err != nil {
+			return
+		}
+		set := make(map[string]bool, len(items))
+		for _, it := range items {
+			set[it.MonitorID] = true
+		}
+		pageMonitors = set
+	}
+	loadPageMonitors()
+
 	_, _ = fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
@@ -122,13 +141,14 @@ func (rt *router) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
+			loadPageMonitors()
 			_, _ = fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
 		case ev, open := <-ch:
 			if !open {
 				return
 			}
-			payload, ok := rt.filterSSEPayload(ev, authed, scopedPage)
+			payload, ok := filterSSEPayload(ev, authed, scopedPage, pageMonitors)
 			if !ok {
 				continue
 			}
@@ -142,7 +162,7 @@ func (rt *router) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (rt *router) filterSSEPayload(ev model.SSEEvent, authed bool, page *model.StatusPage) ([]byte, bool) {
+func filterSSEPayload(ev model.SSEEvent, authed bool, page *model.StatusPage, pageMonitors map[string]bool) ([]byte, bool) {
 	raw, err := json.Marshal(ev.Data)
 	if err != nil {
 		return nil, false
@@ -175,8 +195,7 @@ func (rt *router) filterSSEPayload(ev model.SSEEvent, authed bool, page *model.S
 		if monID == "" {
 			return nil, false
 		}
-		attached, err := rt.cfg.Store.IsMonitorOnStatusPage(page.ID, monID)
-		if err != nil || !attached {
+		if !pageMonitors[monID] {
 			return nil, false
 		}
 		if _, hasMsg := m["message"]; hasMsg {

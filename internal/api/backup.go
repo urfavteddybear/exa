@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,7 +120,9 @@ func (rt *router) handleS3Run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := backup.RunS3Backup(r.Context(), rt.cfg.Store, cfg)
+	runCtx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	res, err := backup.RunS3Backup(runCtx, rt.cfg.Store, cfg)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return

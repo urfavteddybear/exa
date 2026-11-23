@@ -273,6 +273,8 @@ export const api = {
     }),
   deleteStatusPage: (id: string) =>
     request<{ ok?: boolean }>(`/api/v1/status-pages/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  listStatusPageMonitors: (id: string) =>
+    request<StatusPageMonitor[]>(`/api/v1/status-pages/${encodeURIComponent(id)}/monitors`),
   setStatusPageMonitors: (id: string, monitors: StatusPageMonitor[]) =>
     request<{ ok?: boolean }>(`/api/v1/status-pages/${encodeURIComponent(id)}/monitors`, {
       method: 'PUT',
@@ -345,7 +347,6 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
-  exportBackup: () => request<unknown>('/api/v1/backup/export'),
   exportBackupBlob: async (gzip: boolean): Promise<Blob> => {
     const url = gzip ? '/api/v1/backup/export?format=gzip' : '/api/v1/backup/export';
     const res = await fetch(url, { credentials: 'same-origin' });
@@ -361,41 +362,16 @@ export const api = {
     }
     return res.blob();
   },
-  importBackup: (payload: unknown) =>
-    request<BackupImportResponse>('/api/v1/backup/import', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
   importBackupFile: async (file: File): Promise<BackupImportResponse> => {
     const isGzip =
       file.name.toLowerCase().endsWith('.gz') ||
       file.type === 'application/gzip' ||
       file.type === 'application/x-gzip';
-    const res = await fetch('/api/v1/backup/import', {
+    return request<BackupImportResponse>('/api/v1/backup/import', {
       method: 'POST',
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': isGzip ? 'application/gzip' : 'application/json',
-      },
+      headers: { 'Content-Type': isGzip ? 'application/gzip' : 'application/json' },
       body: file,
     });
-    const text = await res.text();
-    let data: unknown = null;
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = text;
-      }
-    }
-    if (!res.ok) {
-      const msg =
-        data && typeof data === 'object' && 'error' in data && typeof (data as { error: unknown }).error === 'string'
-          ? (data as { error: string }).error
-          : `Import failed with status ${res.status}`;
-      throw new ApiError(res.status, msg);
-    }
-    return data as BackupImportResponse;
   },
   testS3Backup: (payload?: S3TestPayload) =>
     request<{ ok: boolean }>('/api/v1/backup/s3/test', {
@@ -420,15 +396,38 @@ export const api = {
 
 export function subscribeStatusStream(slug: string, onEvent: (type: string) => void): () => void {
   const url = slug ? `/api/v1/stream?slug=${encodeURIComponent(slug)}` : '/api/v1/stream';
-  const es = new EventSource(url);
   const events = ['heartbeat', 'status_change', 'incident_update', 'maintenance_update'];
   const handler = (ev: MessageEvent) => {
     onEvent(ev.type);
   };
-  for (const name of events) {
-    es.addEventListener(name, handler);
-  }
+  let es: EventSource;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let delay = 2000;
+  let dropped = false;
+  const connect = () => {
+    es = new EventSource(url);
+    for (const name of events) {
+      es.addEventListener(name, handler);
+    }
+    es.onopen = () => {
+      delay = 2000;
+      if (dropped) {
+        dropped = false;
+        onEvent('reconnect');
+      }
+    };
+    // EventSource retries transient drops itself, but gives up for good after a
+    // non-200 response (429, 502 during restart), so reconnect manually then.
+    es.onerror = () => {
+      dropped = true;
+      if (es.readyState !== EventSource.CLOSED) return;
+      timer = setTimeout(connect, delay);
+      delay = Math.min(delay * 2, 60000);
+    };
+  };
+  connect();
   return () => {
+    clearTimeout(timer);
     for (const name of events) {
       es.removeEventListener(name, handler);
     }

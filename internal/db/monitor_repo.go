@@ -286,16 +286,21 @@ func (s *Store) RecordHeartbeat(ctx context.Context, monitorID string, res model
 	checkedStr := formatTime(checkedAt)
 	day := checkedAt.Format("2006-01-02")
 
-	var upInc, degInc, downInc, downtimeInc int
+	totalInc := 1
+	var upInc, degInc, downInc int
+	countDowntime := false
 	switch res.Status {
 	case model.HeartbeatStatusUp:
 		upInc = 1
 	case model.HeartbeatStatusDegraded:
 		degInc = 1
 	case model.HeartbeatStatusDown:
-		downInc = 1
-		if intervalSec > 0 {
-			downtimeInc = intervalSec
+		if finalStatus == model.ComponentStatusMaintenance {
+			// Planned maintenance is not an outage: keep it out of uptime and downtime.
+			totalInc = 0
+		} else {
+			downInc = 1
+			countDowntime = true
 		}
 	}
 
@@ -310,6 +315,17 @@ func (s *Store) RecordHeartbeat(ctx context.Context, monitorID string, res model
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	downtimeInc := 0
+	if countDowntime {
+		downtimeInc = downtimeSinceLastCheck(ctx, tx, monitorID, checkedAt, intervalSec)
+		// Fast retries land well inside one interval; counting each as a full check would weigh a
+		// 15s blip like several intervals of outage in the count-based uptime %. Their seconds still
+		// go into downtime_sec.
+		if downtimeInc > 0 && downtimeInc*2 < intervalSec {
+			totalInc, downInc = 0, 0
+		}
+	}
+
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO heartbeats (monitor_id, status, latency_ms, status_code, message, checked_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -321,9 +337,9 @@ func (s *Store) RecordHeartbeat(ctx context.Context, monitorID string, res model
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO daily_rollups
 		 (monitor_id, day, total_checks, up_checks, degraded_checks, down_checks, sum_latency_ms, min_latency_ms, max_latency_ms, downtime_sec)
-		 VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(monitor_id, day) DO UPDATE SET
-		   total_checks = total_checks + 1,
+		   total_checks = total_checks + excluded.total_checks,
 		   up_checks = up_checks + excluded.up_checks,
 		   degraded_checks = degraded_checks + excluded.degraded_checks,
 		   down_checks = down_checks + excluded.down_checks,
@@ -331,7 +347,7 @@ func (s *Store) RecordHeartbeat(ctx context.Context, monitorID string, res model
 		   min_latency_ms = CASE WHEN excluded.min_latency_ms < min_latency_ms THEN excluded.min_latency_ms ELSE min_latency_ms END,
 		   max_latency_ms = CASE WHEN excluded.max_latency_ms > max_latency_ms THEN excluded.max_latency_ms ELSE max_latency_ms END,
 		   downtime_sec = downtime_sec + excluded.downtime_sec`,
-		monitorID, day, upInc, degInc, downInc, int64(res.LatencyMs), res.LatencyMs, res.LatencyMs, downtimeInc,
+		monitorID, day, totalInc, upInc, degInc, downInc, int64(res.LatencyMs), res.LatencyMs, res.LatencyMs, downtimeInc,
 	); err != nil {
 		return fmt.Errorf("upsert daily_rollups: %w", err)
 	}
@@ -354,6 +370,27 @@ func (s *Store) RecordHeartbeat(ctx context.Context, monitorID string, res model
 	}
 
 	return tx.Commit()
+}
+
+// downtimeSinceLastCheck returns the real gap since the previous check, capped at one interval,
+// so fast retries add seconds instead of a full interval each and paused gaps add nothing extra.
+func downtimeSinceLastCheck(ctx context.Context, tx *sql.Tx, monitorID string, checkedAt time.Time, intervalSec int) int {
+	if intervalSec <= 0 {
+		return 0
+	}
+	var last sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT last_checked_at FROM monitors WHERE id = ?`, monitorID).Scan(&last); err != nil {
+		return intervalSec
+	}
+	prev := parseNullTime(last)
+	if prev == nil {
+		return intervalSec
+	}
+	gap := int(checkedAt.Sub(*prev).Seconds())
+	if gap <= 0 {
+		return 0
+	}
+	return min(gap, intervalSec)
 }
 
 func (s *Store) ListHeartbeats(monitorID string, limit int) ([]model.Heartbeat, error) {

@@ -24,9 +24,9 @@ Settings can be supplied via environment variables or CLI flags (CLI flags overr
 | `PORT` | `-port` | `8080` | HTTP listen port |
 | `HOST` | `-host` | `0.0.0.0` | HTTP listen interface |
 | `DATA_DIR` | `-data-dir` | `./data` (`/data` in Docker) | Directory storing `exa.db` (`0700` dir, `0600` file) |
-| `BASE_URL` | `-base-url` | Auto-detected from request | Public base URL written into RSS/Atom feeds, push URLs, and unsubscribe links; persisted to `base_url` setting on startup when set |
+| `BASE_URL` | `-base-url` | Auto-detected from request | Public base URL written into RSS/Atom feeds, push URLs, and subscription confirm/unsubscribe links (required for public email subscriptions); persisted to `base_url` setting on startup when set |
 | `COOKIE_SECURE` | none | `true` if `BASE_URL` starts with `https://`, else `false` | Forces `Secure` attribute on the `exa_session` cookie |
-| `TRUST_PROXY` | none | `false` | Reads client IP from `X-Forwarded-For` and scheme from `X-Forwarded-Proto`; enable only behind a reverse proxy that overwrites those headers |
+| `TRUST_PROXY` | none | `false` | Reads client IP from the rightmost `X-Forwarded-For` entry and scheme from `X-Forwarded-Proto`; enable only behind a reverse proxy |
 | none | `-version` | `false` | Prints version and exits |
 
 ### Instance Settings (`settings` table)

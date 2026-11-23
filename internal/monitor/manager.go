@@ -368,6 +368,7 @@ func (m *Manager) runHousekeepingOnce(ctx context.Context, now time.Time) {
 		cutoff := now.AddDate(0, 0, -days)
 		_, _ = m.store.PruneHeartbeats(cutoff)
 		_ = m.store.CleanExpiredSessions()
+		_ = m.store.PruneUnverifiedSubscribers(now.Add(-24 * time.Hour))
 	}
 
 	m.maybeRunScheduledS3Backup(ctx, now)

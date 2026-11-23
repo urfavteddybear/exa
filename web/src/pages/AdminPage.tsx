@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../api';
 import { CloseIcon, MenuIcon, MoonIcon, PulseLogoIcon, SunIcon } from '../components/Icons';
 import type { User } from '../types';
@@ -45,6 +45,7 @@ export function AdminPage({
 }: AdminPageProps) {
   const isAdmin = user.role === 'admin';
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerRef = useRef<HTMLDivElement>(null);
   const [siteTitle, setSiteTitle] = useState('Exa');
   const [monitorCount, setMonitorCount] = useState<number | null>(null);
   const [openIncidentsCount, setOpenIncidentsCount] = useState<number | null>(null);
@@ -66,11 +67,16 @@ export function AdminPage({
 
   useEffect(() => {
     if (!drawerOpen) return;
+    const prevFocus = document.activeElement as HTMLElement | null;
+    drawerRef.current?.querySelector<HTMLElement>('button, a[href]')?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setDrawerOpen(false);
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      prevFocus?.focus?.();
+    };
   }, [drawerOpen]);
 
   const navItems: Array<{ key: AdminTabKey; path: string; label: string; badge?: number | null }> = [
@@ -236,7 +242,7 @@ export function AdminPage({
             if (e.target === e.currentTarget) setDrawerOpen(false);
           }}
         >
-          <div class="admin-drawer-panel" role="dialog" aria-modal="true" aria-label="Navigation menu">
+          <div ref={drawerRef} class="admin-drawer-panel" role="dialog" aria-modal="true" aria-label="Navigation menu">
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
               <button
                 type="button"

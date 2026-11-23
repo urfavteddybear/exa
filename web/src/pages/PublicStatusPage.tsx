@@ -201,20 +201,28 @@ export function PublicStatusPage({ slug, onNavigate, theme, onToggleTheme }: Pub
   const [historyTotal, setHistoryTotal] = useState(0);
 
   const debounceRef = useRef<number | null>(null);
+  const statusSeq = useRef(0);
+  const statusApplied = useRef(0);
+  const historySeq = useRef(0);
 
   const loadStatus = useCallback(
     async (silent = false) => {
+      // Skip responses older than one already applied. Not "latest only": a silent
+      // refresh superseding the first load must not leave the spinner stuck.
+      const id = ++statusSeq.current;
       if (!silent) {
         setLoading(true);
         setError(null);
       }
       try {
         const res = await api.publicStatus(slug);
+        if (id < statusApplied.current) return;
+        statusApplied.current = id;
         setData(res);
         setError(null);
         document.title = res.page.title ? `${res.page.title} | Exa` : 'Exa Status';
       } catch (err) {
-        if (!silent) {
+        if (!silent && id >= statusApplied.current) {
           setError(err instanceof ApiError ? err.message : 'Unable to load status page.');
         }
       } finally {
@@ -268,17 +276,20 @@ export function PublicStatusPage({ slug, onNavigate, theme, onToggleTheme }: Pub
   const loadHistory = useCallback(
     async (pageNum: number) => {
       const targetSlug = data?.page?.slug || slug || 'default';
+      const id = ++historySeq.current;
       setHistoryLoading(true);
       setHistoryError(null);
       try {
         const res = await api.publicIncidents(targetSlug, pageNum, 20);
+        if (id !== historySeq.current) return;
         setHistoryItems(res.incidents || []);
         setHistoryTotal(res.total || 0);
         setHistoryPage(res.page || pageNum);
       } catch (err) {
+        if (id !== historySeq.current) return;
         setHistoryError(err instanceof ApiError ? err.message : 'Unable to load incident history.');
       } finally {
-        setHistoryLoading(false);
+        if (id === historySeq.current) setHistoryLoading(false);
       }
     },
     [data?.page?.slug, slug],

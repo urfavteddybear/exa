@@ -43,6 +43,7 @@ export function StatusPagesTab({
   const [assignLoading, setAssignLoading] = useState(false);
   const [assignSaving, setAssignSaving] = useState(false);
   const [assignError, setAssignError] = useState<string | null>(null);
+  const [assignLoadFailed, setAssignLoadFailed] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -137,23 +138,12 @@ export function StatusPagesTab({
   const openAssign = async (page: StatusPage) => {
     setAssignPage(page);
     setAssignError(null);
+    setAssignLoadFailed(false);
+    setAssignRows([]);
     setAssignLoading(true);
     try {
-      const existing = new Map<string, { group_id: string; display_name: string; sort_order: number }>();
-      try {
-        const pub = await api.publicStatus(page.slug);
-        let order = 0;
-        for (const g of pub.groups || []) {
-          for (const m of g.monitors || []) {
-            existing.set(m.id, { group_id: g.id, display_name: m.name, sort_order: order++ });
-          }
-        }
-        for (const m of pub.ungrouped_monitors || []) {
-          existing.set(m.id, { group_id: '', display_name: m.name, sort_order: order++ });
-        }
-      } catch {
-        // Private status pages may not return public status; fall back to empty initial map.
-      }
+      const assigned = (await api.listStatusPageMonitors(page.id)) || [];
+      const existing = new Map(assigned.map((a) => [a.monitor_id, a]));
       setAssignRows(
         monitors.map((m, idx) => {
           const hit = existing.get(m.id);
@@ -161,12 +151,17 @@ export function StatusPagesTab({
             monitor_id: m.id,
             name: m.name,
             included: Boolean(hit),
-            group_id: hit ? hit.group_id : m.group_id || '',
-            display_name: hit && hit.display_name !== m.name ? hit.display_name : '',
+            // '' = inherit the monitor's own group (saved as null).
+            group_id: hit?.group_id || '',
+            display_name: hit?.display_name || '',
             sort_order: hit ? hit.sort_order : idx,
           };
         }),
       );
+    } catch (err) {
+      // Saving without the current assignments would wipe the page, so block Save.
+      setAssignLoadFailed(true);
+      setAssignError(err instanceof ApiError ? err.message : 'Failed to load current monitor assignments.');
     } finally {
       setAssignLoading(false);
     }
@@ -174,7 +169,7 @@ export function StatusPagesTab({
 
   const handleSaveAssign = async (e: Event) => {
     e.preventDefault();
-    if (!assignPage) return;
+    if (!assignPage || assignLoadFailed) return;
     setAssignSaving(true);
     setAssignError(null);
     try {
@@ -418,7 +413,7 @@ export function StatusPagesTab({
           <form onSubmit={handleSaveAssign}>
             {assignError ? <div class="alert-inline alert-inline--error">{assignError}</div> : null}
 
-            {assignRows.length === 0 ? (
+            {assignLoadFailed ? null : assignRows.length === 0 ? (
               <p class="form-help">No monitors exist yet. Create monitors first in the Monitors tab.</p>
             ) : (
               <div class="table-scroll" style={{ marginBottom: '16px' }}>
@@ -463,7 +458,7 @@ export function StatusPagesTab({
                               );
                             }}
                           >
-                            <option value="">Ungrouped</option>
+                            <option value="">Monitor's group</option>
                             {groups.map((g) => (
                               <option key={g.id} value={g.id}>
                                 {g.name}
@@ -511,7 +506,7 @@ export function StatusPagesTab({
               <button type="button" class="btn" onClick={() => setAssignPage(null)}>
                 Cancel
               </button>
-              <button type="submit" class="btn btn-primary" disabled={assignSaving}>
+              <button type="submit" class="btn btn-primary" disabled={assignSaving || assignLoadFailed}>
                 {assignSaving ? 'Saving...' : 'Save Assignments'}
               </button>
             </div>

@@ -13,6 +13,15 @@ type Route =
   | { kind: 'login' }
   | { kind: 'admin'; tab: AdminTabKey; monitorId?: string; searchQuery?: string };
 
+// Malformed escapes like "/s/100%" make decodeURIComponent throw during render.
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 function parseRoute(fullPath: string): Route {
   const [rawPath, rawQuery = ''] = fullPath.split('?');
   const clean = rawPath.replace(/\/+$/, '') || '/';
@@ -26,7 +35,7 @@ function parseRoute(fullPath: string): Route {
     return { kind: 'admin', tab: 'monitors', searchQuery: q };
   }
   if (clean.startsWith('/admin/monitors/')) {
-    const id = decodeURIComponent(clean.slice('/admin/monitors/'.length));
+    const id = safeDecode(clean.slice('/admin/monitors/'.length));
     if (id) return { kind: 'admin', tab: 'monitor-detail', monitorId: id };
     return { kind: 'admin', tab: 'monitors', searchQuery: q };
   }
@@ -47,7 +56,7 @@ function parseRoute(fullPath: string): Route {
     return { kind: 'admin', tab: 'overview' };
   }
   if (clean.startsWith('/s/')) {
-    const slug = decodeURIComponent(clean.slice(3));
+    const slug = safeDecode(clean.slice(3));
     return { kind: 'public', slug };
   }
   return { kind: 'public' };

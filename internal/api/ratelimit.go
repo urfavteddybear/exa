@@ -83,9 +83,11 @@ func pruneBefore(ts []time.Time, cutoff time.Time) []time.Time {
 
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
+		// Proxies append the peer they saw, so only the rightmost entry is trustworthy;
+		// earlier entries are whatever the client chose to send.
 		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-			first := strings.TrimSpace(strings.Split(xff, ",")[0])
-			if ip := net.ParseIP(first); ip != nil {
+			parts := strings.Split(xff, ",")
+			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
 				return ip.String()
 			}
 		}

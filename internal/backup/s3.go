@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -150,10 +151,9 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 	}
 	return &S3Client{
 		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout: defaultS3Timeout,
-		},
-		nowFn: func() time.Time { return time.Now().UTC() },
+		// No client-wide Timeout: it would cut off large uploads; doSigned bounds each call via ctx instead.
+		httpClient: &http.Client{},
+		nowFn:      func() time.Time { return time.Now().UTC() },
 	}, nil
 }
 
@@ -255,7 +255,7 @@ func (c *S3Client) ListObjects(ctx context.Context) ([]model.S3BackupObject, err
 			return nil, fmt.Errorf("parse s3 list response: %w", err)
 		}
 		for _, item := range res.Contents {
-			if !strings.HasSuffix(item.Key, ".json.gz") && !strings.HasSuffix(item.Key, ".json") {
+			if !isExaBackupKey(item.Key) {
 				continue
 			}
 			lm, _ := parseS3Timestamp(item.LastModified)
@@ -319,6 +319,11 @@ func (c *S3Client) buildTarget(key string, query url.Values) (targetURL, hostHea
 }
 
 func (c *S3Client) doSigned(ctx context.Context, method, key string, query url.Values, body []byte, contentType string) ([]byte, int, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultS3Timeout)
+		defer cancel()
+	}
 	targetURL, hostHeader, canonicalURI, canonicalQuery, err := c.buildTarget(key, query)
 	if err != nil {
 		return nil, 0, err
@@ -396,14 +401,39 @@ func EncodeBackupGzip(data *model.BackupData) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(gz).Encode(data); err != nil {
+	counter := &countingWriter{w: gz}
+	if err := json.NewEncoder(counter).Encode(data); err != nil {
 		_ = gz.Close()
 		return nil, err
 	}
 	if err := gz.Close(); err != nil {
 		return nil, err
 	}
+	// Refuse to produce a backup that DecodeBackupReader would later reject on restore.
+	if counter.n > maxDecodedJSONBytes {
+		return nil, fmt.Errorf("backup JSON is %d MiB, over the %d MiB restore limit; lower heartbeat_retention_days", counter.n>>20, maxDecodedJSONBytes>>20)
+	}
+	if buf.Len() > maxRawBackupBytes {
+		return nil, fmt.Errorf("compressed backup is %d MiB, over the %d MiB restore limit", buf.Len()>>20, maxRawBackupBytes>>20)
+	}
 	return buf.Bytes(), nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// isExaBackupKey limits list, prune, restore, and delete to objects Exa itself wrote.
+func isExaBackupKey(key string) bool {
+	base := path.Base(key)
+	return strings.HasPrefix(base, "exa-backup-") && (strings.HasSuffix(base, ".json.gz") || strings.HasSuffix(base, ".json"))
 }
 
 func DecodeBackupReader(r io.Reader, maxRawBytes, maxDecodedBytes int64) (*model.BackupData, error) {
@@ -560,6 +590,9 @@ func validateObjectKey(key, requiredPrefix string) error {
 	}
 	if requiredPrefix != "" && !strings.HasPrefix(k, requiredPrefix) {
 		return errors.New("backup key does not match configured prefix")
+	}
+	if !isExaBackupKey(k) {
+		return errors.New("backup key is not an Exa backup object")
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, ApiError } from '../../api';
 import { CopyIcon } from '../../components/Icons';
 import { LatencyChart } from '../../components/LatencyChart';
@@ -57,9 +57,11 @@ export function MonitorDetailView({
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const detailSeq = useRef(0);
 
   const loadDetail = useCallback(
     async (selectedRange: MonitorRange, initial = false) => {
+      const id = ++detailSeq.current;
       if (initial) {
         setLoading(true);
         setError(null);
@@ -75,16 +77,21 @@ export function MonitorDetailView({
             : Promise.resolve(null),
           initial ? api.listStatusPages().catch(() => [] as StatusPage[]) : Promise.resolve(null),
         ]);
-        setDetail(res);
         if (gList) setGroups(gList);
         if (cList) setChannels(cList);
         if (pList) setPages(pList);
+        // Drop responses superseded by a newer request (e.g. fast range switching).
+        if (id !== detailSeq.current) return;
+        setDetail(res);
         setError(null);
       } catch (err) {
+        if (id !== detailSeq.current) return;
         setError(err instanceof ApiError ? err.message : 'Unable to load monitor details.');
       } finally {
-        setLoading(false);
-        setRangeLoading(false);
+        if (id === detailSeq.current) {
+          setLoading(false);
+          setRangeLoading(false);
+        }
       }
     },
     [monitorId, isAdmin],

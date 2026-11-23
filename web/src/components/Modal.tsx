@@ -2,6 +2,9 @@ import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { CloseIcon } from './Icons';
 
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 interface ModalProps {
   open: boolean;
   title: string;
@@ -15,6 +18,7 @@ export function Modal({ open, title, onClose, children, footer, wide }: ModalPro
   const panelRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const downOnBackdrop = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -23,6 +27,25 @@ export function Modal({ open, title, onClose, children, footer, wide }: ModalPro
       if (e.key === 'Escape') {
         e.stopPropagation();
         onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab' || !panelRef.current) return;
+      // Keep Tab / Shift+Tab cycling inside the dialog.
+      const items = Array.from(panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (items.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      const outside = !panelRef.current.contains(active);
+      if (e.shiftKey && (active === first || outside)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || outside)) {
+        e.preventDefault();
+        first.focus();
       }
     };
     window.addEventListener('keydown', onKey);
@@ -48,8 +71,12 @@ export function Modal({ open, title, onClose, children, footer, wide }: ModalPro
     <div
       class="modal-backdrop"
       role="presentation"
+      onMouseDown={(e) => {
+        downOnBackdrop.current = e.target === e.currentTarget;
+      }}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        // Ignore clicks from a text drag that started inside the panel.
+        if (e.target === e.currentTarget && downOnBackdrop.current) onClose();
       }}
     >
       <div

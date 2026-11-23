@@ -327,20 +327,20 @@ func TestProbeDNS_MockServer(t *testing.T) {
 			qEnd := idx + 5
 
 			resp := make([]byte, 0, qEnd+16)
-			resp = append(resp, req[0], req[1])     // Transaction ID
-			resp = append(resp, 0x81, 0x80)         // Standard response, no error
-			resp = append(resp, 0x00, 0x01)         // QDCOUNT = 1
-			resp = append(resp, 0x00, 0x01)         // ANCOUNT = 1
-			resp = append(resp, 0x00, 0x00, 0, 0)   // NSCOUNT, ARCOUNT
-			resp = append(resp, req[12:qEnd]...)    // Question section
-			resp = append(resp, 0xc0, 0x0c)         // Name pointer to offset 12
-			resp = append(resp, 0x00, 0x01)         // TYPE A
-			resp = append(resp, 0x00, 0x01)         // CLASS IN
+			resp = append(resp, req[0], req[1])   // Transaction ID
+			resp = append(resp, 0x81, 0x80)       // Standard response, no error
+			resp = append(resp, 0x00, 0x01)       // QDCOUNT = 1
+			resp = append(resp, 0x00, 0x01)       // ANCOUNT = 1
+			resp = append(resp, 0x00, 0x00, 0, 0) // NSCOUNT, ARCOUNT
+			resp = append(resp, req[12:qEnd]...)  // Question section
+			resp = append(resp, 0xc0, 0x0c)       // Name pointer to offset 12
+			resp = append(resp, 0x00, 0x01)       // TYPE A
+			resp = append(resp, 0x00, 0x01)       // CLASS IN
 			ttl := make([]byte, 4)
 			binary.BigEndian.PutUint32(ttl, 60)
 			resp = append(resp, ttl...)
-			resp = append(resp, 0x00, 0x04)         // RDLENGTH = 4
-			resp = append(resp, 127, 0, 0, 42)      // RDATA 127.0.0.42
+			resp = append(resp, 0x00, 0x04)    // RDLENGTH = 4
+			resp = append(resp, 127, 0, 0, 42) // RDATA 127.0.0.42
 			_, _ = pc.WriteTo(resp, addr)
 		}
 	}()
@@ -391,6 +391,12 @@ func TestParsePingOutputAndMatchHelpers(t *testing.T) {
 			name:   "windows sub-ms",
 			output: "Reply from 127.0.0.1: bytes=32 time<1ms TTL=128\nApproximate round trip times in milli-seconds:\n    Minimum = 0ms, Maximum = 0ms, Average = 0ms",
 			want:   0,
+			ok:     true,
+		},
+		{
+			name:   "windows german",
+			output: "Antwort von 10.0.0.1: Bytes=32 Zeit=3ms TTL=64\nAntwort von 10.0.0.1: Bytes=32 Zeit<1ms TTL=64\n    Minimum = 0ms, Maximum = 3ms, Mittelwert = 1ms",
+			want:   2,
 			ok:     true,
 		},
 		{
