@@ -34,13 +34,15 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o exa ./cmd/exa
 
 ### Docker Compose
 
-Start Exa with persistent SQLite storage in `./data`, read-only root filesystem, dropped capabilities, and loopback port binding (`127.0.0.1:8080`):
+Clone and start. Compose pulls the prebuilt image `ghcr.io/urfavteddybear/exa:latest` (amd64 and arm64), stores SQLite data in `./data`, and binds to loopback (`127.0.0.1:8080`). No manual `mkdir` or `chown` is needed:
 
 ```sh
-docker compose up -d --build
+git clone https://github.com/urfavteddybear/exa.git
+cd exa
+docker compose up -d
 ```
 
-Open `http://127.0.0.1:8080/setup` to complete initial setup.
+Open `http://127.0.0.1:8080/setup` to complete initial setup. Update later with `docker compose pull && docker compose up -d`. The image is built and pushed by GitHub Actions on every push to `main`, so nothing is compiled on your machine.
 
 ## Configuration
 
