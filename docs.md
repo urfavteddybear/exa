@@ -60,36 +60,36 @@ Managed via the Admin Settings UI or `GET/PUT /api/v1/settings`:
 
 ### 3.1 Docker Compose (Recommended)
 
-The repository ships with a multi-stage [Dockerfile](Dockerfile) (`node:22-alpine` -> `golang:1.26-alpine` -> `alpine:3.21`) and a hardened [docker-compose.yml](docker-compose.yml):
-- Binds to `127.0.0.1:8080:8080` (loopback only, designed to sit behind a TLS reverse proxy)
-- Runs as non-root `USER exa` with a read-only root filesystem (`read_only: true`) and writable `/tmp` (`tmpfs`) and `/data`
-- Drops all Linux capabilities (`cap_drop: [ALL]`) and sets `no-new-privileges:true`
-- Enables `net.ipv4.ping_group_range: "0 2147483647"` so ICMP `ping` monitors work using unprivileged datagram sockets without `CAP_NET_RAW`, alongside `iputils-ping` in the runtime image
-
-#### Fixing Linux Bind-Mount Permissions (`SQLITE_CANTOPEN` / error 14)
-
-`docker-compose.yml` mounts `./data:/data`. If `./data` does not exist on the host before starting, Docker creates it owned by `root:root` (`0755`), which prevents the non-root `exa` user inside the container from creating `/data/exa.db` and causes:
-
-```text
-msg="failed to open database" err="apply pragma \"PRAGMA journal_mode=WAL;\": unable to open database file (14)"
-```
-
-Choose one of these fixes before running `docker compose up -d`:
-
-1. **Bind mount (`./data:/data`)**: inspect the UID/GID of `exa` inside the built image and chown `./data`:
-
 ```sh
-docker compose build
-docker compose run --rm --no-deps --entrypoint id exa
-# Example output: uid=100(exa) gid=101(exa)
-mkdir -p ./data
-sudo chown -R 100:101 ./data
+git clone https://github.com/urfavteddybear/exa.git
+cd exa
 docker compose up -d
 ```
 
-On hosts with SELinux enforcing (Fedora, RHEL, Rocky Linux), append `:Z` to the volume mount (`./data:/data:Z`).
+[docker-compose.yml](docker-compose.yml) pulls the prebuilt multi-arch image `ghcr.io/urfavteddybear/exa:latest` (`linux/amd64`, `linux/arm64`), which [.github/workflows/docker.yml](.github/workflows/docker.yml) publishes on every push to `main`. A `v1.2.3` git tag also publishes `1.2.3` and `1.2`; pin one of those in `image:` for reproducible deploys. Nothing is built on your machine.
 
-2. **Named Docker volume**: replace `./data:/data` in `docker-compose.yml` with `exa_data:/data` and declare top-level `volumes: exa_data:`. Docker automatically initializes an empty named volume with the container image's `/data` ownership (`exa:exa`).
+Update to the newest image:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+To run a locally modified build instead, tag it with the same name before starting: `docker build -t ghcr.io/urfavteddybear/exa:latest . && docker compose up -d`.
+
+The compose file is hardened:
+- Binds to `127.0.0.1:8080:8080` (loopback only, designed to sit behind a TLS reverse proxy)
+- Read-only root filesystem (`read_only: true`) with writable `/tmp` (`tmpfs`) and `/data`
+- Drops all Linux capabilities except `CHOWN`, `SETUID` and `SETGID`, and sets `no-new-privileges:true`
+- Enables `net.ipv4.ping_group_range: "0 2147483647"` so ICMP `ping` monitors work using unprivileged datagram sockets without `CAP_NET_RAW`, alongside `iputils-ping` in the runtime image
+
+#### Data directory and permissions
+
+`./data` is bind-mounted to `/data`. You don't need to create or chown it: Docker creates it on first start, and the container entrypoint ([docker-entrypoint.sh](docker-entrypoint.sh)) hands `/data` to the unprivileged `exa` user, then runs Exa as `exa` via `su-exec`. The three added capabilities are used only for that step; the Exa process itself has no root privileges.
+
+If you run the container with an explicit non-root `user:`, the entrypoint skips the ownership step, and the host directory must already be writable by that UID.
+
+On hosts with SELinux enforcing (Fedora, RHEL, Rocky Linux), append `:Z` to the volume mount (`./data:/data:Z`).
 
 #### Production Environment Overrides
 

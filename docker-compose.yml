@@ -1,17 +1,24 @@
 services:
   exa:
-    build: .
+    # Prebuilt multi-arch image (amd64, arm64) built and pushed by GitHub Actions (.github/workflows/docker.yml).
+    image: ghcr.io/urfavteddybear/exa:latest
     container_name: exa
     ports:
       # Bind to loopback behind a TLS reverse proxy. Use "8080:8080" only for direct LAN or host exposure.
       - "127.0.0.1:8080:8080"
     volumes:
+      # Docker creates ./data on first start; the entrypoint hands it to the non-root exa user.
       - ./data:/data
     tmpfs:
       - /tmp
     read_only: true
     cap_drop:
       - ALL
+    cap_add:
+      # Only used by the entrypoint to chown /data and switch to the exa user; exa itself runs unprivileged.
+      - CHOWN
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
     sysctls:
