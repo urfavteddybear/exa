@@ -73,4 +73,5 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.value }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # PR tokens may not write the Actions cache (and shouldn't seed it for main), so PRs only read it.
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
