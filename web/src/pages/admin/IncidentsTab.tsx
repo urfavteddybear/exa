@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../../api';
 import { Modal } from '../../components/Modal';
+import { MonitorMultiSelect } from '../../components/MonitorMultiSelect';
 import { StatusBadge } from '../../components/StatusBadge';
 import type {
   Incident,
@@ -316,23 +317,12 @@ export function IncidentsTab({ isAdmin }: { isAdmin: boolean }) {
           {monitors.length > 0 ? (
             <div class="form-field form-field--full">
               <span class="form-label">Affected monitors</span>
-              <div class="action-row">
-                {monitors.map((m) => (
-                  <label key={m.id} class="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={selectedMonitorIds.includes(m.id)}
-                      onChange={(e) => {
-                        const checked = (e.currentTarget as HTMLInputElement).checked;
-                        setSelectedMonitorIds((prev) =>
-                          checked ? [...prev, m.id] : prev.filter((id) => id !== m.id),
-                        );
-                      }}
-                    />
-                    <span>{m.name}</span>
-                  </label>
-                ))}
-              </div>
+              <MonitorMultiSelect
+                label="Affected monitors"
+                monitors={monitors}
+                value={selectedMonitorIds}
+                onChange={setSelectedMonitorIds}
+              />
             </div>
           ) : null}
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../../api';
 import { Modal } from '../../components/Modal';
+import { MonitorMultiSelect } from '../../components/MonitorMultiSelect';
 import { StatusBadge } from '../../components/StatusBadge';
 import type { Maintenance, Monitor, StatusPage } from '../../types';
 import { formatDateTime, maintenanceStatusLabel, toLocalDateTimeInput } from '../../utils/format';
@@ -294,23 +295,12 @@ export function MaintenanceTab({ isAdmin }: { isAdmin: boolean }) {
           {monitors.length > 0 ? (
             <div class="form-field form-field--full">
               <span class="form-label">Affected monitors</span>
-              <div class="action-row">
-                {monitors.map((m) => (
-                  <label key={m.id} class="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={monitorIds.includes(m.id)}
-                      onChange={(e) => {
-                        const checked = (e.currentTarget as HTMLInputElement).checked;
-                        setMonitorIds((prev) =>
-                          checked ? [...prev, m.id] : prev.filter((id) => id !== m.id),
-                        );
-                      }}
-                    />
-                    <span>{m.name}</span>
-                  </label>
-                ))}
-              </div>
+              <MonitorMultiSelect
+                label="Affected monitors"
+                monitors={monitors}
+                value={monitorIds}
+                onChange={setMonitorIds}
+              />
             </div>
           ) : null}
 
